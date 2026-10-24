@@ -1,0 +1,27 @@
+{
+  "name": "afk",
+  "version": "0.1.0",
+  "description": "AFK — AI Flow Kit. A self-contained local workflow engine that routes tasks through requirement, design, implementation, verification and delivery, with AI self-test and self-fix loops. Away From Keyboard.",
+  "author": {
+    "name": "cctice"
+  },
+  "license": "MIT",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "AFK — AI Flow Kit",
+    "shortDescription": "Self-contained AI workflow kit: stage routing, custom steps, auto-verify loop, dev execution with self review.",
+    "longDescription": "AFK routes any coding task through five universal stages: requirement, design, implementation, verification and delivery. It keeps per-project local state, lets users register custom workflow steps, and closes the loop with automated verification and feedback resolution. Everything runs locally with zero external dependencies and zero gatekeeping.",
+    "developerName": "cctice",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "defaultPrompt": "Use afk-flow to route this task through requirement, design, implementation, verification and delivery."
+  },
+  "integration": {
+    "host": "kaleidosphere",
+    "role": "workflow-engine",
+    "bundled": true
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "name": "afk-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AFK — AI Flow Kit. Bundled kaleidosphere workflow-engine plugin. This file only declares the CommonJS scope for skills/afk-flow/scripts/afk.js; the plugin manifest is plugin.json.",
+  "type": "commonjs"
+}

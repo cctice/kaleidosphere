@@ -1,0 +1,21 @@
+{
+  "name": "kaleidosphere",
+  "version": "0.4.2",
+  "private": true,
+  "description": "A plugin-based AI work resource coordination layer for human-agent collaboration.",
+  "type": "commonjs",
+  "scripts": {
+    "test": "node --test",
+    "pack:cli": "npm pack --pack-destination outputs/npm",
+    "release:codex": "node scripts/release-codex.js",
+    "release:marketplace": "node scripts/release-codex.js"
+  },
+  "files": [
+    "cli/",
+    "README.md",
+    "README_CN.md"
+  ],
+  "bin": {
+    "ks": "cli/ks.js"
+  }
+}

@@ -1,0 +1,66 @@
+{
+  "version": 1,
+  "stages": {
+    "requirement": {
+      "summary": "把零散想法整理成有验收标准的任务意图",
+      "steps": [
+        {
+          "step_id": "clarify_intent",
+          "default_skill": "afk-flow",
+          "candidate_skills": ["afk-flow"],
+          "output_purpose": "需求意图与验收标准清单，作为设计输入"
+        }
+      ]
+    },
+    "design": {
+      "summary": "给出能落地的方案草图",
+      "steps": [
+        {
+          "step_id": "solution_sketch",
+          "default_skill": "afk-flow",
+          "candidate_skills": ["afk-flow"],
+          "output_purpose": "方案草图：结构、接口、风险与取舍"
+        }
+      ]
+    },
+    "implementation": {
+      "summary": "以最小步幅写代码，边写边自证",
+      "steps": [
+        {
+          "step_id": "build",
+          "default_skill": "afk-dev",
+          "candidate_skills": ["afk-dev"],
+          "output_purpose": "可运行的实现与配套测试"
+        }
+      ]
+    },
+    "verification": {
+      "summary": "AI 自测自修：跑验证、修问题、复核 diff",
+      "steps": [
+        {
+          "step_id": "self_check",
+          "default_skill": "afk-verify",
+          "candidate_skills": ["afk-verify"],
+          "output_purpose": "自动化验证记录与修复闭环结论"
+        },
+        {
+          "step_id": "self_review",
+          "default_skill": "afk-dev",
+          "candidate_skills": ["afk-dev"],
+          "output_purpose": "对实现 diff 的自代码评审结论"
+        }
+      ]
+    },
+    "delivery": {
+      "summary": "收尾：产物归档与反馈回流",
+      "steps": [
+        {
+          "step_id": "wrap_up",
+          "default_skill": "afk-flow",
+          "candidate_skills": ["afk-flow", "afk-verify"],
+          "output_purpose": "交付摘要：产物清单、验证结论、遗留事项与反馈回流路径"
+        }
+      ]
+    }
+  }
+}
