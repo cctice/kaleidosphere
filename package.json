@@ -3,6 +3,7 @@
   "version": "0.4.2",
   "private": true,
   "description": "A plugin-based AI work resource coordination layer for human-agent collaboration.",
+  "license": "MIT",
   "type": "commonjs",
   "scripts": {
     "test": "node --test",

@@ -1,6 +1,6 @@
 # KaleidoSphere (万花境)
 
-[![version](https://img.shields.io/badge/version-0.4.2-22d3EE)](https://github.com/cctice/kaleidosphere) [![license](https://img.shields.io/badge/license-MIT-3B82F6)](https://github.com/cctice/kaleidosphere/blob/master/package.json) [![tests](https://img.shields.io/badge/tests-passing-brightgreen)](https://github.com/cctice/kaleidosphere/tree/master/tests) [![afk engine](https://img.shields.io/badge/afk_engine-bundled-8B5CF6)](https://github.com/cctice/kaleidosphere/tree/master/plugins/afk) [![node](https://img.shields.io/badge/node-%3E%3D18-339933?logo=node.js&logoColor=white)](https://github.com/cctice/kaleidosphere/blob/master/package.json)
+[![version](https://img.shields.io/badge/version-0.4.2-22d3EE)](https://github.com/cctice/kaleidosphere) [![license](https://img.shields.io/badge/license-MIT-3B82F6)](https://github.com/cctice/kaleidosphere/blob/master/LICENSE) [![tests](https://img.shields.io/badge/tests-passing-brightgreen)](https://github.com/cctice/kaleidosphere/tree/master/tests) [![afk engine](https://img.shields.io/badge/afk_engine-bundled-8B5CF6)](https://github.com/cctice/kaleidosphere/tree/master/plugins/afk) [![node](https://img.shields.io/badge/node-%3E%3D18-339933?logo=node.js&logoColor=white)](https://github.com/cctice/kaleidosphere/blob/master/package.json)
 
 > **The Core Repository & Origin.**
 > _Infinite Patterns from Simple Elements._
