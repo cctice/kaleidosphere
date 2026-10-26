@@ -1703,11 +1703,17 @@ function projectRulesCheck(home, args) {
   return { ...status, compliant: checks.every((check) => check.passed), checks };
 }
 
+const USAGE = 'Usage: ks --help | ks init | ks workspace <add|list> | ks spark <configure|list|find|inspect|create|append-section|check> | ks project <create|register|update|list|search|tag|alias|describe|lifecycle|inspect|resolve|check|migrate|adopt|rules> | ks coordination <open|find|resume|archive> | ks chat-room <open|append|archive|split> | ks version <status|init|check|plan|apply> [--home <path>] [--json]';
+
 function main() {
   const args = process.argv.slice(2);
   const command = args[0];
   if (command === '--version' || command === '-v') {
     process.stdout.write(`${PACKAGE_VERSION}\n`);
+    return;
+  }
+  if (command === '--help' || command === '-h' || command === 'help') {
+    process.stdout.write(`${USAGE}\n`);
     return;
   }
   const json = args.includes('--json');
@@ -1939,7 +1945,7 @@ function main() {
     return;
   }
 
-  throw new Error('Usage: ks init | ks workspace <add|list> | ks project <create|register|update|list|search|tag|alias|describe|lifecycle|inspect|resolve|check|migrate|adopt|rules> | ks coordination <open|find|resume|archive> | ks chat-room <open|append|archive|split> | ks version <status|init|check|plan|apply> [--home <path>] [--json]');
+  throw new Error(USAGE);
 }
 
 try {
