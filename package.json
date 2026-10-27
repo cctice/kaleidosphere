@@ -5,6 +5,9 @@
   "description": "A plugin-based AI work resource coordination layer for human-agent collaboration.",
   "license": "MIT",
   "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "test": "node --test",
     "pack:cli": "npm pack --pack-destination outputs/npm",

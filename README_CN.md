@@ -136,6 +136,8 @@ KaleidoSphere
 
 ## 🛠 开发
 
+环境要求：Node >=18（与 `package.json` 的 `engines` 声明一致）。
+
 执行自动化测试：
 
 ```bash
