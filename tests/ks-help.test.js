@@ -25,7 +25,7 @@ test('usage line documents every command group, including spark', () => {
   for (const group of ['init', 'workspace', 'spark', 'project', 'coordination', 'chat-room', 'version']) {
     assert.ok(help.stdout.includes(`ks ${group}`), `usage must mention the "${group}" group`);
   }
-  assert.match(help.stdout, /ks spark <configure\|list\|find\|inspect\|create\|append-section\|check>/);
+  assert.match(help.stdout, /ks spark <configure\|list\|find\|inspect\|create\|capture\|append-section\|check>/);
   assert.match(help.stdout, /--home <path>/);
   assert.match(help.stdout, /--json/);
 });

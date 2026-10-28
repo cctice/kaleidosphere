@@ -1939,7 +1939,7 @@ function ksRoute(home, args) {
 const SPARK_CAPTURE_SOURCES = new Set(['im', 'mail', 'clipboard']);
 
 function readClipboard(command) {
-  const result = spawnSync(command, { encoding: 'utf8' });
+  const result = spawnSync(command, { encoding: 'utf8', shell: process.platform !== 'win32' });
   if (result.error) throw new Error(`clipboard command failed: ${result.error.message}`);
   if (result.status !== 0) throw new Error(`clipboard command exited ${result.status}: ${(result.stderr || '').trim()}`);
   return result.stdout;
@@ -1974,7 +1974,7 @@ function captureSpark(home, args) {
   return { directory, source, spark: requireSpark(home, sparkId(filePath)).spark };
 }
 
-const USAGE = 'Usage: ks --help | ks init | ks workspace <add|list> | ks spark <configure|list|find|inspect|create|append-section|check> | ks project <create|register|update|list|search|tag|alias|describe|lifecycle|inspect|resolve|check|migrate|adopt|rules> | ks coordination <open|find|resume|archive> | ks chat-room <open|append|archive|split> | ks version <status|init|check|plan|apply> | ks plugin <list|check> | ks workflow <run> | ks market <list> | ks route | ks status [--home <path>] [--json]';
+const USAGE = 'Usage: ks --help | ks init | ks workspace <add|list> | ks spark <configure|list|find|inspect|create|capture|append-section|check> | ks project <create|register|update|list|search|tag|alias|describe|lifecycle|inspect|resolve|check|migrate|adopt|rules> | ks coordination <open|find|resume|archive> | ks chat-room <open|append|archive|split> | ks version <status|init|check|plan|apply> | ks plugin <list|check> | ks workflow <run> | ks market <list> | ks route | ks status [--home <path>] [--json]';
 
 function main() {
   const args = process.argv.slice(2);
@@ -2249,6 +2249,11 @@ function main() {
 
   if (command === 'route') {
     printResult({ ok: true, ...ksRoute(home, args) }, true);
+    return;
+  }
+
+  if (command === 'spark' && args[1] === 'capture') {
+    printResult({ ok: true, ...captureSpark(home, args) }, true);
     return;
   }
 
