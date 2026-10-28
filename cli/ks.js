@@ -1974,7 +1974,7 @@ function captureSpark(home, args) {
   return { directory, source, spark: requireSpark(home, sparkId(filePath)).spark };
 }
 
-const USAGE = 'Usage: ks --help | ks init | ks workspace <add|list> | ks spark <configure|list|find|inspect|create|append-section|check> | ks project <create|register|update|list|search|tag|alias|describe|lifecycle|inspect|resolve|check|migrate|adopt|rules> | ks coordination <open|find|resume|archive> | ks chat-room <open|append|archive|split> | ks version <status|init|check|plan|apply> | ks plugin <list|check> | ks workflow <run> | ks market <list> | ks status [--home <path>] [--json]';
+const USAGE = 'Usage: ks --help | ks init | ks workspace <add|list> | ks spark <configure|list|find|inspect|create|append-section|check> | ks project <create|register|update|list|search|tag|alias|describe|lifecycle|inspect|resolve|check|migrate|adopt|rules> | ks coordination <open|find|resume|archive> | ks chat-room <open|append|archive|split> | ks version <status|init|check|plan|apply> | ks plugin <list|check> | ks workflow <run> | ks market <list> | ks route | ks status [--home <path>] [--json]';
 
 function main() {
   const args = process.argv.slice(2);
@@ -2244,6 +2244,11 @@ function main() {
         process.exitCode = 1;
       }
     );
+    return;
+  }
+
+  if (command === 'route') {
+    printResult({ ok: true, ...ksRoute(home, args) }, true);
     return;
   }
 
