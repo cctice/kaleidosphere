@@ -1958,6 +1958,48 @@ async function marketList(home, args) {
 // ── 转动路由（维护包四轮：多项目轮转的最短路径）───────────────────────────
 // least-recently-routed 选择 + 状态记档：反复 ks route 即在活跃项目间转动，
 // 单字符短命令形态为快捷键/别名与移动端壳复用同一入口。
+// 并发写保护（维护包六轮）：rotation.json 读-改-写与 registry 同样吃多会话并发，
+// 独占锁 + 有限重试 + 陈锁接管（KS_STATE_LOCK_TIMEOUT_MS 可调，崩溃残留不卡死）。
+const STATE_LOCK_STALE_MS = 30 * 1000;
+
+function sleepSync(milliseconds) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
+function withStateLock(home, name, callback) {
+  const lockPath = path.join(home, 'state', `${name}.lock`);
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+  const timeoutMs = Number(process.env.KS_STATE_LOCK_TIMEOUT_MS || 2000);
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    let descriptor;
+    try {
+      descriptor = fs.openSync(lockPath, 'wx');
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      try {
+        const lockAgeMs = Date.now() - fs.statSync(lockPath).mtimeMs;
+        if (lockAgeMs > STATE_LOCK_STALE_MS) {
+          fs.rmSync(lockPath, { force: true });
+          continue; // 陈锁接管：进程崩溃残留不卡死后续操作
+        }
+      } catch (statError) {
+        if (statError.code === 'ENOENT') continue; // 持锁者刚释放，立即重试
+        throw statError;
+      }
+      if (Date.now() >= deadline) throw new Error(`state ${name} is busy (lock held); retry after the active KS operation finishes`);
+      sleepSync(50);
+      continue;
+    }
+    try {
+      return callback();
+    } finally {
+      fs.closeSync(descriptor);
+      fs.rmSync(lockPath, { force: true });
+    }
+  }
+}
+
 function rotationStatePath(home) {
   return path.join(home, 'state', 'rotation.json');
 }
@@ -1976,19 +2018,22 @@ function ksRoute(home, args) {
   if (candidates.length === 0) {
     throw new Error(`no ${lifecycle} projects to route to${tags.length ? ` with tags: ${tags.join(',')}` : ''}; register projects or relax the filter`);
   }
-  const { file, state } = readRotationState(home);
-  const lastRoutedAt = new Map();
-  for (const record of state.history || []) lastRoutedAt.set(record.projectId, record.routedAt);
-  const ranked = [...candidates].sort((left, right) => {
-    const leftAt = lastRoutedAt.get(left.id) || '';
-    const rightAt = lastRoutedAt.get(right.id) || '';
-    return leftAt.localeCompare(rightAt) || left.createdAt.localeCompare(right.createdAt);
+  const outcome = withStateLock(home, 'rotation', () => {
+    const { file, state } = readRotationState(home);
+    const lastRoutedAt = new Map();
+    for (const record of state.history || []) lastRoutedAt.set(record.projectId, record.routedAt);
+    const ranked = [...candidates].sort((left, right) => {
+      const leftAt = lastRoutedAt.get(left.id) || '';
+      const rightAt = lastRoutedAt.get(right.id) || '';
+      return leftAt.localeCompare(rightAt) || left.createdAt.localeCompare(right.createdAt);
+    });
+    const selected = ranked[0];
+    state.history = [...(state.history || []).filter((record) => record.projectId !== selected.id), { projectId: selected.id, routedAt: new Date().toISOString() }].slice(-50);
+    writeJson(file, state);
+    const upcoming = ranked.slice(1, 3).map((project) => project.name);
+    return { selected, upcoming, historySize: state.history.length };
   });
-  const selected = ranked[0];
-  state.history = [...(state.history || []).filter((record) => record.projectId !== selected.id), { projectId: selected.id, routedAt: new Date().toISOString() }].slice(-50);
-  writeJson(file, state);
-  const upcoming = ranked.slice(1, 3).map((project) => project.name);
-  return { project: selected, rotated: candidates.length > 1, upcoming, historySize: state.history.length };
+  return { project: outcome.selected, rotated: candidates.length > 1, upcoming: outcome.upcoming, historySize: outcome.historySize };
 }
 
 // ── 灵感捕获外部源通道（维护包四轮）──────────────────────────────────────
