@@ -215,7 +215,7 @@ function sparkFrontMatter(content) {
   const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
   if (!match) return {};
   const read = (key) => match[1].match(new RegExp(`^${key}:\\s*(.+)$`, 'm'))?.[1]?.trim() || null;
-  return { title: read('title'), date: read('date'), scope: read('scope') };
+  return { title: read('title'), date: read('date'), scope: read('scope'), source: read('source') };
 }
 
 function listSparks(home) {
@@ -235,6 +235,7 @@ function listSparks(home) {
         path: filePath,
         date: metadata.date,
         scope: metadata.scope || 'global',
+        source: metadata.source || null,
         updatedAt: stat.mtime.toISOString()
       };
     })
@@ -1703,7 +1704,275 @@ function projectRulesCheck(home, args) {
   return { ...status, compliant: checks.every((check) => check.passed), checks };
 }
 
-const USAGE = 'Usage: ks --help | ks init | ks workspace <add|list> | ks spark <configure|list|find|inspect|create|append-section|check> | ks project <create|register|update|list|search|tag|alias|describe|lifecycle|inspect|resolve|check|migrate|adopt|rules> | ks coordination <open|find|resume|archive> | ks chat-room <open|append|archive|split> | ks version <status|init|check|plan|apply> [--home <path>] [--json]';
+// ── 插件契约（维护包四轮：双形态收敛为单一规范）────────────────────────────
+// 规范（canonical contract）：plugin.json 的 skills 字段必须是目录引用字符串 './skills/'。
+// 历史双形态（skills 数组逐项列目录）不再作为并列契约——装载侧统一经
+// normalizePluginContract 归一化并打 normalized 标记，新插件一律按规范书写，
+// 每接一个插件不再各付一次桥适配税。
+const CANONICAL_SKILLS_FORM = './skills/';
+
+function bundledPluginsDirectory() {
+  return path.join(__dirname, '..', 'plugins');
+}
+
+function installedPluginsDirectory(home) {
+  return path.join(home, 'plugins');
+}
+
+function discoverPlugins(home) {
+  const roots = [
+    { source: 'bundled', dir: bundledPluginsDirectory() },
+    { source: 'installed', dir: installedPluginsDirectory(home) }
+  ];
+  const found = [];
+  for (const { source, dir } of roots) {
+    if (!fs.existsSync(dir)) continue;
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const manifestPath = path.join(dir, entry.name, 'plugin.json');
+      if (!fs.existsSync(manifestPath)) continue;
+      found.push({ source, name: entry.name, dir: path.join(dir, entry.name), manifestPath });
+    }
+  }
+  return found;
+}
+
+/** 契约校验+归一化：字段完整性 → skills 双形态归一 → skills 目录与 SKILL.md 实存 */
+function inspectPluginContract(manifestPath, pluginDir) {
+  const issues = [];
+  let manifest = null;
+  try {
+    manifest = readJson(manifestPath);
+  } catch (error) {
+    return { name: path.basename(pluginDir), passed: false, normalized: false, skills: null, issues: [`plugin.json 无法解析：${error.message}`] };
+  }
+  if (!manifest.name || typeof manifest.name !== 'string') issues.push('plugin.json 缺少合法 name 字段');
+  if (!manifest.version || typeof manifest.version !== 'string') issues.push('plugin.json 缺少合法 version 字段');
+
+  let skills = manifest.skills;
+  let normalized = false;
+  if (skills === CANONICAL_SKILLS_FORM) {
+    // 规范形态，直接通过
+  } else if (Array.isArray(skills) && skills.length > 0 && skills.every((item) => typeof item === 'string' && item.startsWith('./skills/'))) {
+    skills = CANONICAL_SKILLS_FORM;
+    normalized = true;
+  } else {
+    issues.push(`skills 字段必须是目录引用 '${CANONICAL_SKILLS_FORM}'（历史数组形态会被装载侧归一化；缺失/空数组/其他取值即违约）`);
+  }
+  const skillsDir = path.join(pluginDir, 'skills');
+  if (Array.isArray(manifest.skills) || manifest.skills === CANONICAL_SKILLS_FORM) {
+    if (!fs.existsSync(skillsDir)) issues.push(`声明的 skills 目录不存在：${skillsDir}`);
+  }
+  return { name: manifest.name || path.basename(pluginDir), version: manifest.version || null, passed: issues.length === 0, normalized, skills, source: null, issues };
+}
+
+function listPlugins(home) {
+  return discoverPlugins(home).map(({ source, dir, manifestPath }) => ({
+    ...inspectPluginContract(manifestPath, dir),
+    source,
+    dir
+  }));
+}
+
+function checkPlugins(home) {
+  const plugins = listPlugins(home).map(({ source, dir, ...report }) => ({ ...report, source, dir, remediation: report.passed ? null : '按 canonical 契约修正 plugin.json（skills: "./skills/"），并保证 skills/ 下至少一个含 SKILL.md 的技能目录' }));
+  return { compliant: plugins.every((plugin) => plugin.passed), count: plugins.length, plugins };
+}
+
+// ── workflow 桥（维护包四轮：P1 深集成——ks 数据注入 bundled afk 引擎）─────
+// 一次性 handoff：不自动开流（blueprint 约束），只产出指向 plugins/afk 的
+// 转交提示，并把 registry 里的项目元数据（名称/路径/摘要/标签/生命周期）随行注入，
+// afk 不再停留在与 ks 数据隔离的 bundled 内置形态。
+function workflowRun(home, args) {
+  const task = option(args, '--task', true).trim();
+  if (!task) throw new Error('--task must not be empty');
+  const { project } = requireProject(home, coordinationProjectId(args));
+  const engine = { name: 'afk', skill: 'afk-flow', dir: path.join(bundledPluginsDirectory(), 'afk') };
+  const skillEntry = path.join(engine.dir, 'skills', 'afk-flow', 'SKILL.md');
+  if (!fs.existsSync(skillEntry)) {
+    throw new Error(`bundled afk engine skill is missing: ${skillEntry}`);
+  }
+  const context = {
+    project: { id: project.id, name: project.name, path: project.path, summary: project.summary, tags: project.tags, lifecycle: project.lifecycle },
+    task
+  };
+  const prompt = [
+    `Use the afk-flow skill (${skillEntry}) to route this task through requirement, design, implementation, verification and delivery.`,
+    `Project: ${project.name} (${project.id}) at ${project.path}`,
+    project.summary ? `Summary: ${project.summary}` : null,
+    project.tags.length > 0 ? `Tags: ${project.tags.join(', ')}` : null,
+    `Lifecycle: ${project.lifecycle}`,
+    `Task: ${task}`
+  ].filter(Boolean).join('\n');
+  return { engine, skillEntry, context, prompt, handoff: 'one-shot', autoStart: false };
+}
+
+// ── 四大能力支柱状态面板（维护包四轮）────────────────────────────────────
+// blueprint 四支柱：项目管理 / 版本管理 / 规则沉淀 / 执行协调。
+// 统一面板 + 新用户引导动线：缺什么就给下一条 ks 命令，不藏着掖着。
+function pillarStates(home) {
+  const initialized = fs.existsSync(path.join(home, 'registry', 'projects.json'));
+  const workspaces = initialized ? listWorkspaces(home) : [];
+  const projects = initialized ? listProjects(home) : [];
+  const byLifecycle = { active: 0, paused: 0, archived: 0 };
+  for (const project of projects) byLifecycle[project.lifecycle] += 1;
+  const versioningManaged = projects.filter((project) => project.versioning?.enabled === true).length;
+  const rulesManaged = projects.filter((project) => project.layout === 'worksite' && fs.existsSync(projectRulesPath(project))).length;
+  let coordination = { active: 0, units: 0, rooms: 0 };
+  if (initialized && fs.existsSync(coordinationStatePath(home))) {
+    const { state } = readCoordinationState(home);
+    const active = state.coordinations.filter((item) => item.status === 'active');
+    coordination = {
+      active: active.length,
+      units: active.reduce((sum, item) => sum + item.units.filter((unit) => unit.status === 'active').length, 0),
+      rooms: active.reduce((sum, item) => sum + item.rooms.filter((room) => room.status === 'active').length, 0)
+    };
+  }
+  const sparksConfigured = initialized && fs.existsSync(path.join(home, 'registry', 'sparks.json')) && Boolean(readJson(path.join(home, 'registry', 'sparks.json')).directory);
+  return {
+    pillars: [
+      { id: 'project', summary: `${workspaces.length} workspaces / ${projects.length} projects（active ${byLifecycle.active} · paused ${byLifecycle.paused} · archived ${byLifecycle.archived}）`, state: projects.length > 0 ? 'ready' : workspaces.length > 0 ? 'partial' : 'empty' },
+      { id: 'versioning', summary: `${versioningManaged}/${projects.length} projects 由 KS 管理版本`, state: versioningManaged > 0 ? 'ready' : 'empty' },
+      { id: 'rules', summary: `${rulesManaged}/${projects.length} projects 沉淀了元规则`, state: rulesManaged > 0 ? 'ready' : 'empty' },
+      { id: 'coordination', summary: `active ${coordination.active} / units ${coordination.units} / rooms ${coordination.rooms}`, state: coordination.active > 0 ? 'ready' : 'empty' }
+    ],
+    sparksConfigured,
+    initialized
+  };
+}
+
+function ksStatus(home) {
+  const view = pillarStates(home);
+  const nextSteps = [];
+  if (!view.initialized) {
+    nextSteps.push({ step: 1, command: 'ks init', why: '初始化用户级注册表（KS 状态的唯一读写边界）' });
+  } else {
+    const projects = listProjects(home);
+    if (listWorkspaces(home).length === 0) nextSteps.push({ step: nextSteps.length + 1, command: 'ks workspace add --id <id> --path <dir>', why: '登记第一个工作空间' });
+    if (projects.length === 0) nextSteps.push({ step: nextSteps.length + 1, command: 'ks project create --workspace <id> --name <kebab-name>', why: '在登记的工作空间里创建第一个项目' });
+    if (!view.sparksConfigured) nextSteps.push({ step: nextSteps.length + 1, command: 'ks spark configure --path <dir>', why: '配置火花目录，启用灵感捕获' });
+    if (!projects.some((project) => project.versioning?.enabled === true)) nextSteps.push({ step: nextSteps.length + 1, command: 'ks version init --id <project-id> --version <semver>', why: '为首个项目声明版本管理策略' });
+    if (view.pillars.find((pillar) => pillar.id === 'coordination').state === 'empty') nextSteps.push({ step: nextSteps.length + 1, command: 'ks coordination open --project-id <id> --anchor-source <src> --anchor-id <id> --scope-key <key>', why: '复杂任务先立执行协调单元' });
+  }
+  return { pillars: view.pillars, sparksConfigured: view.sparksConfigured, onboarding: { complete: nextSteps.length === 0, nextSteps } };
+}
+
+// ── 插件市场接线（维护包四轮：P4 支柱对接 workflow-party 清单）──────────────
+// 读 workflow-party 形态的 marketplace.json（本地路径或 https URL），
+// 逐条校验条目契约（name/version/source），本地 source 顺带过插件契约检查。
+async function marketList(home, args) {
+  const source = option(args, '--source', true);
+  let manifest;
+  if (/^https:\/\//.test(source)) {
+    const response = await fetch(source);
+    if (!response.ok) throw new Error(`marketplace fetch failed: ${response.status} ${source}`);
+    manifest = await response.json();
+  } else {
+    let manifestPath = path.resolve(source);
+    if (fs.existsSync(manifestPath) && fs.statSync(manifestPath).isDirectory()) {
+      manifestPath = [path.join(manifestPath, '.claude-plugin', 'marketplace.json'), path.join(manifestPath, 'marketplace.json')].find((candidate) => fs.existsSync(candidate));
+      if (!manifestPath) throw new Error(`marketplace manifest not found under: ${source}`);
+    }
+    if (!fs.existsSync(manifestPath)) throw new Error(`marketplace manifest does not exist: ${manifestPath}`);
+    manifest = readJson(manifestPath);
+  }
+  if (!Array.isArray(manifest.plugins)) throw new Error('marketplace manifest missing plugins array');
+  const baseDir = /^https:\/\//.test(source) ? null : path.dirname(path.resolve(source));
+  const entries = manifest.plugins.map((entry) => {
+    const issues = [];
+    if (!entry.name || typeof entry.name !== 'string') issues.push('entry missing name');
+    if (!entry.version || typeof entry.version !== 'string') issues.push(`entry ${entry.name || '<unnamed>'} missing version`);
+    if (!entry.source || typeof entry.source !== 'string') issues.push(`entry ${entry.name || '<unnamed>'} missing source`);
+    let local = null;
+    if (baseDir && entry.source && !/^https?:\/\//.test(entry.source)) {
+      const pluginDir = path.resolve(baseDir, entry.source);
+      const manifestPath = path.join(pluginDir, 'plugin.json');
+      if (fs.existsSync(manifestPath)) local = { ...inspectPluginContract(manifestPath, pluginDir), dir: pluginDir, passed: undefined };
+      else issues.push(`local source has no plugin.json: ${pluginDir}`);
+    }
+    return { name: entry.name || null, version: entry.version || null, category: entry.category || null, source: entry.source || null, integrity: entry.integrity || null, local, issues };
+  });
+  return { market: manifest.name || null, owner: manifest.owner?.name || null, source, count: entries.length, plugins: entries, allValid: entries.every((entry) => entry.issues.length === 0) };
+}
+
+// ── 转动路由（维护包四轮：多项目轮转的最短路径）───────────────────────────
+// least-recently-routed 选择 + 状态记档：反复 ks route 即在活跃项目间转动，
+// 单字符短命令形态为快捷键/别名与移动端壳复用同一入口。
+function rotationStatePath(home) {
+  return path.join(home, 'state', 'rotation.json');
+}
+
+function readRotationState(home) {
+  const file = rotationStatePath(home);
+  if (!fs.existsSync(file)) return { file, state: { schemaVersion: SCHEMA_VERSION, history: [] } };
+  return { file, state: readJson(file) };
+}
+
+function ksRoute(home, args) {
+  const tags = options(args, '--tag').map(validateProjectTag);
+  const lifecycle = option(args, '--lifecycle') || 'active';
+  validateProjectLifecycle(lifecycle);
+  const candidates = listProjects(home, args).filter((project) => project.lifecycle === lifecycle);
+  if (candidates.length === 0) {
+    throw new Error(`no ${lifecycle} projects to route to${tags.length ? ` with tags: ${tags.join(',')}` : ''}; register projects or relax the filter`);
+  }
+  const { file, state } = readRotationState(home);
+  const lastRoutedAt = new Map();
+  for (const record of state.history || []) lastRoutedAt.set(record.projectId, record.routedAt);
+  const ranked = [...candidates].sort((left, right) => {
+    const leftAt = lastRoutedAt.get(left.id) || '';
+    const rightAt = lastRoutedAt.get(right.id) || '';
+    return leftAt.localeCompare(rightAt) || left.createdAt.localeCompare(right.createdAt);
+  });
+  const selected = ranked[0];
+  state.history = [...(state.history || []).filter((record) => record.projectId !== selected.id), { projectId: selected.id, routedAt: new Date().toISOString() }].slice(-50);
+  writeJson(file, state);
+  const upcoming = ranked.slice(1, 3).map((project) => project.name);
+  return { project: selected, rotated: candidates.length > 1, upcoming, historySize: state.history.length };
+}
+
+// ── 灵感捕获外部源通道（维护包四轮）──────────────────────────────────────
+// 火花不再只来自手写文件：im/mail 文本通道 + 剪贴板（darwin pbpaste），
+// source 元信息落 frontmatter，采集→入库一步完成。
+const SPARK_CAPTURE_SOURCES = new Set(['im', 'mail', 'clipboard']);
+
+function readClipboard(command) {
+  const result = spawnSync(command, { encoding: 'utf8' });
+  if (result.error) throw new Error(`clipboard command failed: ${result.error.message}`);
+  if (result.status !== 0) throw new Error(`clipboard command exited ${result.status}: ${(result.stderr || '').trim()}`);
+  return result.stdout;
+}
+
+function captureSpark(home, args) {
+  const source = option(args, '--source', true);
+  if (!SPARK_CAPTURE_SOURCES.has(source)) {
+    throw new Error(`--source must be one of: ${[...SPARK_CAPTURE_SOURCES].join(', ')}`);
+  }
+  const title = option(args, '--title', true).trim();
+  if (!title) throw new Error('--title must not be empty');
+  const contentFile = option(args, '--content-file');
+  const text = option(args, '--text');
+  let body = null;
+  if (source === 'clipboard') {
+    if (text !== undefined || contentFile !== undefined) throw new Error('clipboard capture reads the system clipboard; do not pass --text/--content-file');
+    const command = option(args, '--clipboard-command') || (process.platform === 'darwin' ? 'pbpaste' : 'wl-paste');
+    body = readClipboard(command).trim();
+  } else {
+    if (Boolean(text) === Boolean(contentFile)) throw new Error(`${source} capture requires exactly one of --text or --content-file`);
+    body = contentFile ? fs.readFileSync(path.resolve(contentFile), 'utf8') : text;
+    body = body.trim();
+  }
+  if (!body) throw new Error(`captured content from ${source} is empty`);
+  const directory = sparkDirectory(home);
+  fs.mkdirSync(directory, { recursive: true });
+  const filePath = path.join(directory, `${sparkSlug(title)}.md`);
+  if (fs.existsSync(filePath)) throw new Error(`spark already exists: ${filePath}`);
+  const date = new Date().toISOString().slice(0, 10);
+  fs.writeFileSync(filePath, `---\ntitle: ${title}\ndate: ${date}\nscope: global\nsource: ${source}\n---\n\n# ${title}\n\n${body}\n`);
+  return { directory, source, spark: requireSpark(home, sparkId(filePath)).spark };
+}
+
+const USAGE = 'Usage: ks --help | ks init | ks workspace <add|list> | ks spark <configure|list|find|inspect|create|append-section|check> | ks project <create|register|update|list|search|tag|alias|describe|lifecycle|inspect|resolve|check|migrate|adopt|rules> | ks coordination <open|find|resume|archive> | ks chat-room <open|append|archive|split> | ks version <status|init|check|plan|apply> | ks plugin <list|check> [--home <path>] [--json]';
 
 function main() {
   const args = process.argv.slice(2);
@@ -1942,6 +2211,16 @@ function main() {
 
   if (command === 'project' && args[1] === 'rules' && args[2] === 'apply') {
     printResult({ ok: true, ...applyProjectRulesPlan(home, args) }, true);
+    return;
+  }
+
+  if (command === 'plugin' && args[1] === 'list') {
+    printResult({ ok: true, count: 0, plugins: listPlugins(home) }, true);
+    return;
+  }
+
+  if (command === 'plugin' && args[1] === 'check') {
+    printResult({ ok: true, ...checkPlugins(home) }, true);
     return;
   }
 
