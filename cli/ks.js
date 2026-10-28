@@ -1863,13 +1863,16 @@ function ksStatus(home) {
 async function marketList(home, args) {
   const source = option(args, '--source', true);
   let manifest;
+  let resolvedBaseDir = null;
   if (/^https:\/\//.test(source)) {
     const response = await fetch(source);
     if (!response.ok) throw new Error(`marketplace fetch failed: ${response.status} ${source}`);
     manifest = await response.json();
   } else {
     let manifestPath = path.resolve(source);
+    resolvedBaseDir = path.dirname(manifestPath);
     if (fs.existsSync(manifestPath) && fs.statSync(manifestPath).isDirectory()) {
+      resolvedBaseDir = manifestPath;
       manifestPath = [path.join(manifestPath, '.claude-plugin', 'marketplace.json'), path.join(manifestPath, 'marketplace.json')].find((candidate) => fs.existsSync(candidate));
       if (!manifestPath) throw new Error(`marketplace manifest not found under: ${source}`);
     }
@@ -1877,17 +1880,16 @@ async function marketList(home, args) {
     manifest = readJson(manifestPath);
   }
   if (!Array.isArray(manifest.plugins)) throw new Error('marketplace manifest missing plugins array');
-  const baseDir = /^https:\/\//.test(source) ? null : path.dirname(path.resolve(source));
   const entries = manifest.plugins.map((entry) => {
     const issues = [];
     if (!entry.name || typeof entry.name !== 'string') issues.push('entry missing name');
     if (!entry.version || typeof entry.version !== 'string') issues.push(`entry ${entry.name || '<unnamed>'} missing version`);
     if (!entry.source || typeof entry.source !== 'string') issues.push(`entry ${entry.name || '<unnamed>'} missing source`);
     let local = null;
-    if (baseDir && entry.source && !/^https?:\/\//.test(entry.source)) {
-      const pluginDir = path.resolve(baseDir, entry.source);
+    if (resolvedBaseDir && entry.source && !/^https?:\/\//.test(entry.source)) {
+      const pluginDir = path.resolve(resolvedBaseDir, entry.source);
       const manifestPath = path.join(pluginDir, 'plugin.json');
-      if (fs.existsSync(manifestPath)) local = { ...inspectPluginContract(manifestPath, pluginDir), dir: pluginDir, passed: undefined };
+      if (fs.existsSync(manifestPath)) local = { ...inspectPluginContract(manifestPath, pluginDir), dir: pluginDir };
       else issues.push(`local source has no plugin.json: ${pluginDir}`);
     }
     return { name: entry.name || null, version: entry.version || null, category: entry.category || null, source: entry.source || null, integrity: entry.integrity || null, local, issues };
@@ -1972,7 +1974,7 @@ function captureSpark(home, args) {
   return { directory, source, spark: requireSpark(home, sparkId(filePath)).spark };
 }
 
-const USAGE = 'Usage: ks --help | ks init | ks workspace <add|list> | ks spark <configure|list|find|inspect|create|append-section|check> | ks project <create|register|update|list|search|tag|alias|describe|lifecycle|inspect|resolve|check|migrate|adopt|rules> | ks coordination <open|find|resume|archive> | ks chat-room <open|append|archive|split> | ks version <status|init|check|plan|apply> | ks plugin <list|check> | ks workflow <run> | ks status [--home <path>] [--json]';
+const USAGE = 'Usage: ks --help | ks init | ks workspace <add|list> | ks spark <configure|list|find|inspect|create|append-section|check> | ks project <create|register|update|list|search|tag|alias|describe|lifecycle|inspect|resolve|check|migrate|adopt|rules> | ks coordination <open|find|resume|archive> | ks chat-room <open|append|archive|split> | ks version <status|init|check|plan|apply> | ks plugin <list|check> | ks workflow <run> | ks market <list> | ks status [--home <path>] [--json]';
 
 function main() {
   const args = process.argv.slice(2);
@@ -2231,6 +2233,17 @@ function main() {
 
   if (command === 'status') {
     printResult({ ok: true, ...ksStatus(home) }, true);
+    return;
+  }
+
+  if (command === 'market' && args[1] === 'list') {
+    marketList(home, args).then(
+      (result) => printResult({ ok: true, ...result }, true),
+      (error) => {
+        process.stderr.write(`ks: ${error.message}\n`);
+        process.exitCode = 1;
+      }
+    );
     return;
   }
 
