@@ -1860,15 +1860,63 @@ function ksStatus(home) {
 // ── 插件市场接线（维护包四轮：P4 支柱对接 workflow-party 清单）──────────────
 // 读 workflow-party 形态的 marketplace.json（本地路径或 https URL），
 // 逐条校验条目契约（name/version/source），本地 source 顺带过插件契约检查。
+// 发现缓存（维护包六轮）：本地源按指纹（mtimeNs+size）即时失效、远端源按 TTL，
+// --refresh 强制穿透——发布新版插件不再等 TTL 自然过期，文件一变立即重读。
+const MARKET_CACHE_TTL_MS = 5 * 60 * 1000;
+
+function marketCacheFile(home, source) {
+  const digest = createHash('sha256').update(source).digest('hex').slice(0, 24);
+  return path.join(home, 'state', 'market-cache', `${digest}.json`);
+}
+
+function localManifestFingerprint(file) {
+  const stats = fs.statSync(file);
+  // mtimeMs 亚毫秒浮点（mtimeNs 在部分 Node 构建缺失），配 size 双信号
+  return { mtimeMs: String(stats.mtimeMs), size: stats.size };
+}
+
+function readMarketCache(cacheFile) {
+  if (!fs.existsSync(cacheFile)) return null;
+  try {
+    const cached = readJson(cacheFile);
+    return cached && cached.source !== undefined ? cached : null; // 坏记录当 miss，不许倒
+  } catch {
+    return null;
+  }
+}
+
+function fingerprintMatches(left, right) {
+  return Boolean(left && right && left.mtimeMs === right.mtimeMs && left.size === right.size);
+}
+
 async function marketList(home, args) {
   const source = option(args, '--source', true);
+  const refresh = args.includes('--refresh');
+  const cacheFile = marketCacheFile(home, source);
+  const cached = refresh ? null : readMarketCache(cacheFile);
   let manifest;
+  let manifestOrigin;
+  let manifestFingerprint = null;
   let resolvedBaseDir = null;
+  let cacheHit = false;
   if (/^https:\/\//.test(source)) {
-    const response = await fetch(source);
-    if (!response.ok) throw new Error(`marketplace fetch failed: ${response.status} ${source}`);
-    manifest = await response.json();
+    manifestOrigin = 'https';
+    const fresh = cached && cached.origin === 'https' && Date.now() - Date.parse(cached.fetchedAt) < MARKET_CACHE_TTL_MS;
+    if (fresh) {
+      manifest = cached.manifest;
+      cacheHit = true;
+    } else {
+      let response;
+      try {
+        response = await fetch(source);
+      } catch (error) {
+        throw new Error(`marketplace fetch failed: ${error.message} (${source})`);
+      }
+      if (!response.ok) throw new Error(`marketplace fetch failed: ${response.status} ${source}`);
+      manifest = await response.json();
+    }
   } else {
+    manifestOrigin = 'local';
     let manifestPath = path.resolve(source);
     resolvedBaseDir = path.dirname(manifestPath);
     if (fs.existsSync(manifestPath) && fs.statSync(manifestPath).isDirectory()) {
@@ -1877,7 +1925,13 @@ async function marketList(home, args) {
       if (!manifestPath) throw new Error(`marketplace manifest not found under: ${source}`);
     }
     if (!fs.existsSync(manifestPath)) throw new Error(`marketplace manifest does not exist: ${manifestPath}`);
-    manifest = readJson(manifestPath);
+    manifestFingerprint = localManifestFingerprint(manifestPath);
+    if (cached && cached.origin === 'local' && fingerprintMatches(cached.fingerprint, manifestFingerprint)) {
+      manifest = cached.manifest;
+      cacheHit = true;
+    } else {
+      manifest = readJson(manifestPath);
+    }
   }
   if (!Array.isArray(manifest.plugins)) throw new Error('marketplace manifest missing plugins array');
   const entries = manifest.plugins.map((entry) => {
@@ -1894,7 +1948,11 @@ async function marketList(home, args) {
     }
     return { name: entry.name || null, version: entry.version || null, category: entry.category || null, source: entry.source || null, integrity: entry.integrity || null, local, issues };
   });
-  return { market: manifest.name || null, owner: manifest.owner?.name || null, source, count: entries.length, plugins: entries, allValid: entries.every((entry) => entry.issues.length === 0) };
+  if (!cacheHit || refresh) {
+    fs.mkdirSync(path.dirname(cacheFile), { recursive: true });
+    writeJson(cacheFile, { schemaVersion: SCHEMA_VERSION, source, origin: manifestOrigin, fetchedAt: new Date().toISOString(), fingerprint: manifestFingerprint, manifest });
+  }
+  return { market: manifest.name || null, owner: manifest.owner?.name || null, source, count: entries.length, plugins: entries, allValid: entries.every((entry) => entry.issues.length === 0), cache: { hit: cacheHit, refreshed: refresh } };
 }
 
 // ── 转动路由（维护包四轮：多项目轮转的最短路径）───────────────────────────
@@ -1974,7 +2032,7 @@ function captureSpark(home, args) {
   return { directory, source, spark: requireSpark(home, sparkId(filePath)).spark };
 }
 
-const USAGE = 'Usage: ks --help | ks init | ks workspace <add|list> | ks spark <configure|list|find|inspect|create|capture|append-section|check> | ks project <create|register|update|list|search|tag|alias|describe|lifecycle|inspect|resolve|check|migrate|adopt|rules> | ks coordination <open|find|resume|archive> | ks chat-room <open|append|archive|split> | ks version <status|init|check|plan|apply> | ks plugin <list|check> | ks workflow <run> | ks market <list> | ks route | ks status [--home <path>] [--json]';
+const USAGE = 'Usage: ks --help | ks init | ks workspace <add|list> | ks spark <configure|list|find|inspect|create|capture|append-section|check> | ks project <create|register|update|list|search|tag|alias|describe|lifecycle|inspect|resolve|check|migrate|adopt|rules> | ks coordination <open|find|resume|archive> | ks chat-room <open|append|archive|split> | ks version <status|init|check|plan|apply> | ks plugin <list|check> | ks workflow <run> | ks market <list> --source <path|url> [--refresh] | ks route | ks status [--home <path>] [--json]';
 
 function main() {
   const args = process.argv.slice(2);
