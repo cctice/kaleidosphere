@@ -1855,7 +1855,25 @@ function ksStatus(home) {
     if (!projects.some((project) => project.versioning?.enabled === true)) nextSteps.push({ step: nextSteps.length + 1, command: 'ks version init --id <project-id> --version <semver>', why: '为首个项目声明版本管理策略' });
     if (view.pillars.find((pillar) => pillar.id === 'coordination').state === 'empty') nextSteps.push({ step: nextSteps.length + 1, command: 'ks coordination open --project-id <id> --anchor-source <src> --anchor-id <id> --scope-key <key>', why: '复杂任务先立执行协调单元' });
   }
-  return { pillars: view.pillars, sparksConfigured: view.sparksConfigured, onboarding: { complete: nextSteps.length === 0, nextSteps } };
+  // 转动提醒闭环（维护包八轮）：route 依赖手动调用，"该转下一块玻璃时没人喊"。
+  // status 从 rotation.json 真源读数：多活跃项目 + 停转超过阈值（KS_ROUTE_REMIND_DAYS，
+  // 默认 3 天，0 关闭）即在 reminders 面点名 ks route——提醒挂在状态面，不混入 onboarding。
+  let rotation = null;
+  const reminders = [];
+  if (view.initialized) {
+    const projects = listProjects(home);
+    const active = projects.filter((project) => project.lifecycle === 'active');
+    const history = readRotationState(home).state.history || [];
+    const lastRoutedAt = history.length ? history[history.length - 1].routedAt : null;
+    const idleDays = lastRoutedAt ? Math.floor((Date.now() - Date.parse(lastRoutedAt)) / 86_400_000) : null;
+    const remindAfterDays = Number(process.env.KS_ROUTE_REMIND_DAYS ?? 3);
+    const due = active.length > 1 && remindAfterDays > 0 && (idleDays === null || idleDays >= remindAfterDays);
+    rotation = { activeProjects: active.length, lastRoutedAt, idleDays, remindAfterDays, due };
+    if (due) {
+      reminders.push({ command: 'ks route', why: `${active.length} 个活跃项目停转 ${idleDays === null ? '从未转动' : `${idleDays} 天`}（阈值 ${remindAfterDays} 天）——该换下一块玻璃了` });
+    }
+  }
+  return { pillars: view.pillars, sparksConfigured: view.sparksConfigured, rotation, reminders, onboarding: { complete: nextSteps.length === 0, nextSteps } };
 }
 
 // ── 插件市场接线（维护包四轮：P4 支柱对接 workflow-party 清单）──────────────
