@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { randomUUID, createHash } = require('node:crypto');
+const zlib = require('node:zlib');
 const { spawnSync } = require('node:child_process');
 
 const SCHEMA_VERSION = 1;
@@ -1889,9 +1890,8 @@ function fingerprintMatches(left, right) {
   return Boolean(left && right && left.mtimeMs === right.mtimeMs && left.size === right.size);
 }
 
-async function marketList(home, args) {
-  const source = option(args, '--source', true);
-  const refresh = args.includes('--refresh');
+/** 清单装载（list/install/upgrade 共用）：来源解析+缓存，返回原始 manifest 与基目录 */
+async function loadMarketManifest(home, source, { refresh = false } = {}) {
   const cacheFile = marketCacheFile(home, source);
   const cached = refresh ? null : readMarketCache(cacheFile);
   let manifest;
@@ -1934,6 +1934,17 @@ async function marketList(home, args) {
     }
   }
   if (!Array.isArray(manifest.plugins)) throw new Error('marketplace manifest missing plugins array');
+  if (!cacheHit || refresh) {
+    fs.mkdirSync(path.dirname(cacheFile), { recursive: true });
+    writeJson(cacheFile, { schemaVersion: SCHEMA_VERSION, source, origin: manifestOrigin, fetchedAt: new Date().toISOString(), fingerprint: manifestFingerprint, manifest });
+  }
+  return { manifest, origin: manifestOrigin, resolvedBaseDir, cacheHit, refreshed: refresh };
+}
+
+async function marketList(home, args) {
+  const source = option(args, '--source', true);
+  const refresh = args.includes('--refresh');
+  const { manifest, resolvedBaseDir, cacheHit } = await loadMarketManifest(home, source, { refresh });
   const entries = manifest.plugins.map((entry) => {
     const issues = [];
     if (!entry.name || typeof entry.name !== 'string') issues.push('entry missing name');
@@ -1948,11 +1959,186 @@ async function marketList(home, args) {
     }
     return { name: entry.name || null, version: entry.version || null, category: entry.category || null, source: entry.source || null, integrity: entry.integrity || null, local, issues };
   });
-  if (!cacheHit || refresh) {
-    fs.mkdirSync(path.dirname(cacheFile), { recursive: true });
-    writeJson(cacheFile, { schemaVersion: SCHEMA_VERSION, source, origin: manifestOrigin, fetchedAt: new Date().toISOString(), fingerprint: manifestFingerprint, manifest });
+  // 已装标记（八轮）：list 与 install/upgrade 生命周期同源读 state/installed.json
+  const installedState = readInstalledState(home);
+  for (const entry of entries) {
+    const installed = installedState[entry.name];
+    entry.installed = installed ? (installed.version === entry.version ? 'current' : `stale(${installed.version})`) : false;
   }
   return { market: manifest.name || null, owner: manifest.owner?.name || null, source, count: entries.length, plugins: entries, allValid: entries.every((entry) => entry.issues.length === 0), cache: { hit: cacheHit, refreshed: refresh } };
+}
+
+// ── 市场安装/升级生命周期（维护包八轮）─────────────────────────────────────
+// market list 只读了三轮：发现之后仍要人装。本轮补 install/upgrade：
+//   - 安装=验指纹（市场 integrity ↔ 产物实文件 sha256，wfp 台账的消费侧闭合）
+//     → 解包过 canonical 插件契约 → 落 home/plugins/<name>/ → state/installed.json
+//     记档（版本/来源/指纹/时刻），plugin list 立即可见（discoverPlugins 同目录）；
+//   - 升级=读 installed.json 对照市场版本：同版如实 upToDate、低版如实拒绝、
+//     高版走同一验证链替换；
+//   - 诚实边界：https 市场与远端 source 的产物拉取通道不在本轮（本地市场先通），
+//     不装半截。
+function sha256File(file) {
+  return `sha256:${createHash('sha256').update(fs.readFileSync(file)).digest('hex')}`;
+}
+
+function installedStateFile(home) {
+  return path.join(home, 'state', 'installed.json');
+}
+
+function readInstalledState(home) {
+  try {
+    const state = readJson(installedStateFile(home));
+    return state && typeof state === 'object' ? state : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeInstalledState(home, state) {
+  return withStateLock(home, 'installed', () => writeJson(installedStateFile(home), state));
+}
+
+/** 解 tar.gz（package/ 根形态）到 destDir；路径逃逸与缺 plugin.json 直接抛 */
+function extractPluginTarball(tgzPath, destDir) {
+  const buf = zlib.gunzipSync(fs.readFileSync(tgzPath));
+  fs.mkdirSync(destDir, { recursive: true });
+  let offset = 0;
+  let sawPluginManifest = false;
+  const written = [];
+  while (offset + 512 <= buf.length) {
+    const header = buf.subarray(offset, offset + 512);
+    if (header.every((byte) => byte === 0)) break;
+    const rawName = header.subarray(0, 100).toString('utf8').replace(/\0.*$/s, '');
+    const prefix = header.subarray(345, 500).toString('utf8').replace(/\0.*$/s, '');
+    const typeFlag = String.fromCharCode(header[156]);
+    const size = parseInt(header.subarray(124, 136).toString('utf8').replace(/\0.*$/s, '').trim() || '0', 8);
+    offset += 512;
+    const data = buf.subarray(offset, offset + size);
+    offset += Math.ceil(size / 512) * 512;
+    if (typeFlag !== '0' && typeFlag !== '\0' && typeFlag !== '5') continue; // 只认文件与目录
+    const name = prefix ? `${prefix}/${rawName}` : rawName;
+    const rel = name.replace(/^[^/]+\//, ''); // 剥 package/ 根
+    if (!rel || rel === '.') continue;
+    const dest = path.join(destDir, rel);
+    if (!path.resolve(dest).startsWith(path.resolve(destDir) + path.sep)) {
+      throw new Error(`tar entry escapes destination: ${name}`);
+    }
+    if (typeFlag === '5') {
+      fs.mkdirSync(dest, { recursive: true });
+      continue;
+    }
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.writeFileSync(dest, data);
+    written.push(rel);
+    if (rel === 'plugin.json') sawPluginManifest = true;
+  }
+  if (!sawPluginManifest) throw new Error('tarball has no package/plugin.json — not a plugin-form artifact');
+  return written;
+}
+
+/** semver 数值比较：1.10.0 > 1.9.0（按段，缺段补 0） */
+function compareVersions(left, right) {
+  const parse = (v) => String(v || '').split('.').map((part) => parseInt(part, 10) || 0);
+  const [a, b] = [parse(left), parse(right)];
+  const len = Math.max(a.length, b.length);
+  for (let i = 0; i < len; i++) {
+    const diff = (a[i] || 0) - (b[i] || 0);
+    if (diff) return Math.sign(diff);
+  }
+  return 0;
+}
+
+/** 验证+解包+落位共用链：install 与 upgrade 同一条验证路径，不各说各话 */
+async function installMarketPlugin(home, source, name, { refresh = false, force = false } = {}) {
+  const { manifest, origin, resolvedBaseDir } = await loadMarketManifest(home, source, { refresh });
+  const entry = (manifest.plugins || []).find((plugin) => plugin.name === name);
+  if (!entry) {
+    throw new Error(`market has no plugin '${name}' (available: ${(manifest.plugins || []).map((plugin) => plugin.name).join(', ') || 'none'})`);
+  }
+  if (origin === 'https' || /^https?:\/\//.test(entry.source)) {
+    throw new Error(`install requires a local marketplace source (https artifact fetch is not wired yet); refusing half-install of ${name}`);
+  }
+  const artifact = path.resolve(resolvedBaseDir, entry.source, 'resources', `${name}-${entry.version}.tgz`);
+  if (!fs.existsSync(artifact)) {
+    throw new Error(`artifact not found: ${artifact}（市场源先重建产物：npm run rebuild:artifacts）`);
+  }
+  // 完整性闸门：市场 integrity ↔ 产物实指纹（wfp provenance 链的消费侧闭合）
+  const actual = sha256File(artifact);
+  const integrityVerified = Boolean(entry.integrity);
+  if (entry.integrity && actual !== entry.integrity) {
+    throw new Error(`integrity mismatch for ${name}@${entry.version}: manifest ${entry.integrity} != artifact ${actual} — refusing to install`);
+  }
+  // 解包到临时区过契约，坏了不落 home
+  const stage = fs.mkdtempSync(path.join(os.tmpdir(), 'ks-install-'));
+  try {
+    extractPluginTarball(artifact, stage);
+    const contract = inspectPluginContract(path.join(stage, 'plugin.json'), stage);
+    if (!contract.passed) {
+      throw new Error(`artifact fails canonical plugin contract: ${contract.issues.join('; ')}`);
+    }
+    const dest = path.join(installedPluginsDirectory(home), name);
+    const state = readInstalledState(home);
+    const prior = state[name];
+    if (prior && prior.version === entry.version && !force) {
+      throw new Error(`${name}@${entry.version} already installed (use --force to reinstall, or 'ks market upgrade ${name}')`);
+    }
+    fs.rmSync(dest, { recursive: true, force: true });
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.cpSync(stage, dest, { recursive: true });
+    state[name] = {
+      version: entry.version,
+      marketSource: source,
+      artifact: path.relative(resolvedBaseDir, artifact),
+      integrity: entry.integrity || null,
+      contentSha256: actual,
+      integrityVerified,
+      installedAt: new Date().toISOString(),
+      dir: dest
+    };
+    writeInstalledState(home, state);
+    return {
+      ok: true,
+      name,
+      version: entry.version,
+      installedVersion: prior ? prior.version : null,
+      dir: dest,
+      integrityVerified,
+      contentSha256: actual,
+      skills: contract.skills
+    };
+  } finally {
+    fs.rmSync(stage, { recursive: true, force: true });
+  }
+}
+
+async function marketInstall(home, args) {
+  const name = args[2];
+  if (!name) throw new Error('usage: ks market install <name> --source <path> [--refresh] [--force]');
+  return installMarketPlugin(home, option(args, '--source', true), name, {
+    refresh: args.includes('--refresh'),
+    force: args.includes('--force')
+  });
+}
+
+async function marketUpgrade(home, args) {
+  const name = args[2];
+  if (!name) throw new Error('usage: ks market upgrade <name> --source <path> [--refresh]');
+  const prior = readInstalledState(home)[name];
+  if (!prior) throw new Error(`${name} is not installed (start with: ks market install ${name} --source <path>)`);
+  const { manifest, resolvedBaseDir } = await loadMarketManifest(home, option(args, '--source', true), {
+    refresh: args.includes('--refresh')
+  });
+  const entry = (manifest.plugins || []).find((plugin) => plugin.name === name);
+  if (!entry) throw new Error(`market has no plugin '${name}' anymore (was installed from ${prior.marketSource})`);
+  const comparison = compareVersions(entry.version, prior.version);
+  if (comparison === 0) {
+    return { ok: true, upToDate: true, name, version: prior.version, note: '市场与已装同版，无事可做' };
+  }
+  if (comparison < 0) {
+    throw new Error(`market version ${entry.version} is older than installed ${prior.version}（市场源指向旧市场？升级拒绝降级）`);
+  }
+  const result = await installMarketPlugin(home, option(args, '--source', true), name, { force: true });
+  return { ...result, upgraded: true, from: prior.version, to: entry.version, marketDir: resolvedBaseDir };
 }
 
 // ── 转动路由（维护包四轮：多项目轮转的最短路径）───────────────────────────
@@ -2077,7 +2263,7 @@ function captureSpark(home, args) {
   return { directory, source, spark: requireSpark(home, sparkId(filePath)).spark };
 }
 
-const USAGE = 'Usage: ks --help | ks init | ks workspace <add|list> | ks spark <configure|list|find|inspect|create|capture|append-section|check> | ks project <create|register|update|list|search|tag|alias|describe|lifecycle|inspect|resolve|check|migrate|adopt|rules> | ks coordination <open|find|resume|archive> | ks chat-room <open|append|archive|split> | ks version <status|init|check|plan|apply> | ks plugin <list|check> | ks workflow <run> | ks market <list> --source <path|url> [--refresh] | ks route | ks status [--home <path>] [--json]';
+const USAGE = 'Usage: ks --help | ks init | ks workspace <add|list> | ks spark <configure|list|find|inspect|create|capture|append-section|check> | ks project <create|register|update|list|search|tag|alias|describe|lifecycle|inspect|resolve|check|migrate|adopt|rules> | ks coordination <open|find|resume|archive> | ks chat-room <open|append|archive|split> | ks version <status|init|check|plan|apply> | ks plugin <list|check> | ks workflow <run> | ks market <list|install|upgrade> <name> --source <path|url> [--refresh] [--force] | ks route | ks status [--home <path>] [--json]';
 
 function main() {
   const args = process.argv.slice(2);
@@ -2339,8 +2525,9 @@ function main() {
     return;
   }
 
-  if (command === 'market' && args[1] === 'list') {
-    marketList(home, args).then(
+  if (command === 'market' && (args[1] === 'list' || args[1] === 'install' || args[1] === 'upgrade')) {
+    const handler = args[1] === 'list' ? marketList : args[1] === 'install' ? marketInstall : marketUpgrade;
+    handler(home, args).then(
       (result) => printResult({ ok: true, ...result }, true),
       (error) => {
         process.stderr.write(`ks: ${error.message}\n`);
