@@ -2281,7 +2281,106 @@ function captureSpark(home, args) {
   return { directory, source, spark: requireSpark(home, sparkId(filePath)).spark };
 }
 
-const USAGE = 'Usage: ks --help | ks init | ks workspace <add|list> | ks spark <configure|list|find|inspect|create|capture|append-section|check> | ks project <create|register|update|list|search|tag|alias|describe|lifecycle|inspect|resolve|check|migrate|adopt|rules> | ks coordination <open|find|resume|archive> | ks chat-room <open|append|archive|split> | ks version <status|init|check|plan|apply> | ks plugin <list|check> | ks workflow <run> | ks market <list|install|upgrade> <name> --source <path|url> [--refresh] [--force] | ks route | ks status [--home <path>] [--json]';
+// ── registry 共享形态（维护心跳包·九轮）：单机 json → 多工作区/团队共享 ──
+// export 吐自包含 bundle（workspaces+projects），import 按 id 合流：新 id 入册、
+// 同 id 同容跳过、同 id 漂移点名不静默覆盖（--force 才让来客赢）——共享不等于互踩。
+function registryExport(home) {
+  const projectsFile = path.join(home, 'registry', 'projects.json');
+  const workspacesFile = path.join(home, 'registry', 'workspaces.json');
+  if (!fs.existsSync(projectsFile) || !fs.existsSync(workspacesFile)) {
+    throw new Error('registry is not initialized; run ks init first');
+  }
+  return {
+    schema: 1,
+    exportedAt: new Date().toISOString(),
+    workspaces: readJson(workspacesFile).workspaces,
+    projects: readJson(projectsFile).projects.map(normalizeProject)
+  };
+}
+
+function mergeById(current, incoming, isEqual = (a, b) => JSON.stringify(a) === JSON.stringify(b)) {
+  const byId = new Map(current.map((entry) => [entry.id, entry]));
+  const added = [];
+  const skipped = [];
+  const conflicted = [];
+  for (const entry of incoming) {
+    const existing = byId.get(entry.id);
+    if (!existing) {
+      byId.set(entry.id, entry);
+      added.push(entry.id);
+    } else if (isEqual(existing, entry)) {
+      skipped.push(entry.id);
+    } else {
+      conflicted.push(entry.id);
+    }
+  }
+  return { merged: [...byId.values()], added, skipped, conflicted };
+}
+
+// workspace 的 path 是机器本地字段（各自 checkout 位置）：同 id 不同 path 是共享常态，
+// 比较时剥离 path——只有 id 之外的字段漂移才算冲突；本地 path 永不被来客覆盖。
+const sameWorkspaceIdentity = (a, b) => {
+  const strip = ({ path, ...rest }) => rest;
+  return JSON.stringify(strip(a)) === JSON.stringify(strip(b));
+};
+
+function registryImport(home, args) {
+  const file = option(args, '--file', true);
+  const force = args.includes('--force');
+  const bundlePath = path.resolve(file);
+  if (!fs.existsSync(bundlePath)) throw new Error(`bundle file not found: ${bundlePath}`);
+  let bundle;
+  try {
+    bundle = readJson(bundlePath);
+  } catch (error) {
+    throw new Error(`bundle is not valid JSON: ${error.message}`);
+  }
+  if (bundle.schema !== 1) throw new Error(`unsupported bundle schema: ${String(bundle.schema)}`);
+  if (!Array.isArray(bundle.projects) || !Array.isArray(bundle.workspaces)) {
+    throw new Error('bundle must carry projects[] and workspaces[] (ks registry export output)');
+  }
+  return withStateLock(home, 'registry', () => {
+    const projectsFile = path.join(home, 'registry', 'projects.json');
+    const workspacesFile = path.join(home, 'registry', 'workspaces.json');
+    if (!fs.existsSync(projectsFile)) throw new Error('registry is not initialized; run ks init first');
+    const projectsDoc = readJson(projectsFile);
+    const workspacesDoc = readJson(workspacesFile);
+    const incomingProjects = bundle.projects.map(normalizeProject);
+    const p = mergeById(projectsDoc.projects, incomingProjects);
+    const w = mergeById(workspacesDoc.workspaces, bundle.workspaces, sameWorkspaceIdentity);
+    const hasConflict = p.conflicted.length > 0 || w.conflicted.length > 0;
+    if (hasConflict && !force) {
+      throw new Error(
+        `conflicting ids without --force: ${[...p.conflicted, ...w.conflicted].join(', ')} (local versions kept; re-run with --force to let the bundle win)`
+      );
+    }
+    const byIdForce = (current, incoming) => [...new Map([...current, ...incoming].map((entry) => [entry.id, entry])).values()];
+    const finalProjects = hasConflict ? byIdForce(projectsDoc.projects, incomingProjects) : p.merged;
+    const forceWorkspaces = byIdForce(
+      workspacesDoc.workspaces,
+      bundle.workspaces.map((entry) => {
+        const local = workspacesDoc.workspaces.find((ws) => ws.id === entry.id);
+        return local ? { ...entry, path: local.path } : entry; // --force 也不夺本地 path
+      })
+    );
+    const finalWorkspaces = hasConflict ? forceWorkspaces : w.merged;
+    const changed = p.added.length > 0 || w.added.length > 0 || hasConflict;
+    if (changed) {
+      projectsDoc.projects = finalProjects;
+      workspacesDoc.workspaces = finalWorkspaces;
+      writeJson(projectsFile, projectsDoc);
+      writeJson(workspacesFile, workspacesDoc);
+    }
+    return {
+      force,
+      changed,
+      projects: { added: p.added, skipped: p.skipped, overwritten: hasConflict ? p.conflicted : [] },
+      workspaces: { added: w.added, skipped: w.skipped, overwritten: hasConflict ? w.conflicted : [] }
+    };
+  });
+}
+
+const USAGE = 'Usage: ks --help | ks init | ks workspace <add|list> | ks spark <configure|list|find|inspect|create|capture|append-section|check> | ks project <create|register|update|list|search|tag|alias|describe|lifecycle|inspect|resolve|check|migrate|adopt|rules> | ks coordination <open|find|resume|archive> | ks chat-room <open|append|archive|split> | ks version <status|init|check|plan|apply> | ks plugin <list|check> | ks workflow <run> | ks market <list|install|upgrade> <name> --source <path|url> [--refresh] [--force] | ks registry <export|import> --file <path> [--force] | ks route | ks status [--home <path>] [--json]';
 
 function main() {
   const args = process.argv.slice(2);
@@ -2552,6 +2651,16 @@ function main() {
         process.exitCode = 1;
       }
     );
+    return;
+  }
+
+  if (command === 'registry' && args[1] === 'export') {
+    printResult({ ok: true, ...registryExport(home) }, true);
+    return;
+  }
+
+  if (command === 'registry' && args[1] === 'import') {
+    printResult({ ok: true, ...registryImport(home, args) }, true);
     return;
   }
 
