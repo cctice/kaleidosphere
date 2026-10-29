@@ -2380,7 +2380,7 @@ function registryImport(home, args) {
   });
 }
 
-const USAGE = 'Usage: ks --help | ks init | ks workspace <add|list> | ks spark <configure|list|find|inspect|create|capture|append-section|check> | ks project <create|register|update|list|search|tag|alias|describe|lifecycle|inspect|resolve|check|migrate|adopt|rules> | ks coordination <open|find|resume|archive> | ks chat-room <open|append|archive|split> | ks version <status|init|check|plan|apply> | ks plugin <list|check> | ks workflow <run> | ks market <list|install|upgrade> <name> --source <path|url> [--refresh] [--force] | ks registry <export|import> --file <path> [--force] | ks route | ks status [--home <path>] [--json]';
+const USAGE = 'Usage: ks --help | ks init | ks workspace <add|list> | ks spark <configure|list|find|inspect|create|capture|append-section|check> | ks project <create|register|update|list|search|tag|alias|describe|lifecycle|inspect|resolve|check|migrate|adopt|rules> | ks coordination <open|find|resume|archive> | ks chat-room <open|append|archive|split> | ks version <status|init|check|plan|apply> | ks plugin <list|check> | ks workflow <run> | ks market <list|install|upgrade> <name> --source <path|url> [--refresh] [--force] | ks registry <export|import> --file <path> [--force] | ks route [--shell] | ks status [--home <path>] [--json]';
 
 function main() {
   const args = process.argv.slice(2);
@@ -2665,7 +2665,14 @@ function main() {
   }
 
   if (command === 'route') {
-    printResult({ ok: true, ...ksRoute(home, args) }, true);
+    const outcome = ksRoute(home, args);
+    if (args.includes('--shell')) {
+      // 移动端壳面（九轮）：单行 name<TAB>path——iOS 快捷指令「Run script over SSH」
+      // 直接拿输出接下一动作；转动副作用（rotation 记档）与常规 route 完全同源。
+      process.stdout.write(`${outcome.project.name}\t${outcome.project.path}\n`);
+      return;
+    }
+    printResult({ ok: true, ...outcome }, true);
     return;
   }
 
