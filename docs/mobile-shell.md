@@ -42,3 +42,54 @@
 
 - 本页是壳的第一步（快捷指令形态），不是原生 App：离线、通知、widget 是后续题。
 - SSH 出网依赖 Tailscale 在场；Tailscale 不在则快捷指令如实失败（不假绿）。
+
+## 离线能力（第二步：缓存计划 + 离线队列重放）
+
+> 维护心跳包·十二轮：第一步的壳在线依赖 SSH——断网零能力。第二步把断网场景
+> 拆成读面（下一块玻璃去哪）与写面（断网时想到的火花）分别落地，全部复用
+> 桌面端同一状态面，不另起平行系统。
+
+### 读面：缓存计划（`ks route --plan`）
+
+route 的选择是确定性排序（least-recently-routed + createdAt 决胜），所以未来
+几步**离线可算**：
+
+```sh
+node /path/to/kaleidosphere/cli/ks.js route --plan 5 --json
+# 或壳机面：route --plan 5 --shell  → 每行 name<TAB>path，按未来转动顺序
+```
+
+快捷指令配方：
+
+1. 新建「KS 同步」快捷指令：Run Script Over SSH 跑上面命令 → **Set Variable**
+   `KS_ROUTE_PLAN`（快捷指令变量存在手机本地，断网可读）。
+2. 新建「下一块玻璃（离线）」快捷指令：Get Variable `KS_ROUTE_PLAN` → 显示
+   前 2-3 项 + `generatedAt`（"缓存于 N 小时前"）。绑 Action Button——断网时
+   长按也有答案，Mac 不在场也不白屏。
+3. `--plan` 是只读预演：rotation.json 分毫不动；桌面端离线期间真转过则计划
+   过期——`generatedAt` 如实展示，不冒充实时。重新联网跑一次「KS 同步」即刷新。
+
+### 写面：离线队列重放（`ks spark capture --batch`）
+
+断网时想到的火花先进快捷指令本地队列（Dictionary 累加），联网后一次回放：
+
+1. 新建「KS 采火花（离线安全）」快捷指令：Ask for Input（标题、正文）→
+   Append to Dictionary 存进本地队列（不触网，立即成功）。
+2. 新建「KS 回放队列」快捷指令：取队列 → **Get Contents of JSON** 组装成
+   `[{title, text, source?}]` 数组 → Base64/文件传给 Mac → Run Script Over SSH：
+
+   ```sh
+   node /path/to/kaleidosphere/cli/ks.js spark capture --batch /tmp/ks-queue.json --source im --json
+   ```
+
+3. 回放幂等：已存在（上次回放到一半断线）按 slug 跳过不报错，报告里
+   `created/skipped-exists/failed` 三态逐条可见；单条坏不连坐；队列文件
+   本身不认则零写入整批拒绝。成功后清空本地队列。
+
+### 边界（如实·第二步后）
+
+- 离线读面 = 缓存计划（只读预测）：桌面端离线期间转动过则计划过期，以
+  `generatedAt` 为准；不是实时状态。
+- 离线写面 = 延迟重放：火花不是实时入库，回到桌面 `ks spark list` 可见
+  （source 随行回溯）。
+- 通知、widget 定时刷新仍是后续题（需要原生/半原生壳，本仓 CLI 面不吹成完成）。

@@ -2240,6 +2240,52 @@ function ksRoute(home, args) {
   return { project: outcome.selected, rotated: candidates.length > 1, upcoming: outcome.upcoming, historySize: outcome.historySize };
 }
 
+// ── 移动壳离线读面（维护包十二轮）：缓存计划 ──────────────────────────────
+// 断网时 SSH 跑不了 ks route——"下一块玻璃"零能力。route 选择本身是确定性
+// 排序（least-recently-routed + createdAt 决胜），--plan 把未来 N 步离线
+// 可算：壳联网时同步一次计划进快捷指令变量，断网后照读。只读无副作用
+// （rotation.json 分毫不动）；桌面端离线期间真转过则计划过期——generatedAt
+// 随行如实展示，不冒充实时。
+function ksRoutePlan(home, args) {
+  const lifecycle = option(args, '--lifecycle') || 'active';
+  validateProjectLifecycle(lifecycle);
+  const requested = Number(option(args, '--plan') || 3);
+  if (!Number.isInteger(requested) || requested < 1 || requested > 20) {
+    throw new Error('--plan requires an integer between 1 and 20');
+  }
+  const candidates = listProjects(home, args).filter((project) => project.lifecycle === lifecycle);
+  if (candidates.length === 0) {
+    throw new Error(`no ${lifecycle} projects to plan${args.includes('--tag') ? ' with the given tags' : ''}; register projects or relax the filter`);
+  }
+  const { state } = readRotationState(home);
+  const lastRoutedAt = new Map();
+  for (const record of state.history || []) lastRoutedAt.set(record.projectId, record.routedAt);
+
+  // 模拟连续转动：每步选中后视为"刚转过"（排到队尾），再选下一个——
+  // 与反复 ks route 的真实序一致（同秒连转时 createdAt 决胜不漂移）。
+  const steps = [];
+  const simulated = new Map(lastRoutedAt);
+  let clock = Date.now();
+  for (let step = 0; step < requested && step < candidates.length; step += 1) {
+    const ranked = [...candidates].sort((left, right) => {
+      const leftAt = simulated.get(left.id) || '';
+      const rightAt = simulated.get(right.id) || '';
+      return leftAt.localeCompare(rightAt) || left.createdAt.localeCompare(right.createdAt);
+    });
+    const selected = ranked[0];
+    clock += 1; // 单调递增的人造时戳：保证后续步骤把已选者排到队尾
+    simulated.set(selected.id, new Date(clock).toISOString());
+    steps.push({ id: selected.id, name: selected.name, path: selected.path });
+  }
+  return {
+    generatedAt: new Date().toISOString(),
+    lifecycle,
+    candidates: candidates.length,
+    plan: steps,
+    note: 'deterministic preview of successive ks route picks; read-only, re-sync after any real route'
+  };
+}
+
 // ── 灵感捕获外部源通道（维护包四轮）──────────────────────────────────────
 // 火花不再只来自手写文件：im/mail 文本通道 + 剪贴板（darwin pbpaste），
 // source 元信息落 frontmatter，采集→入库一步完成。
@@ -2272,13 +2318,67 @@ function captureSpark(home, args) {
     body = body.trim();
   }
   if (!body) throw new Error(`captured content from ${source} is empty`);
+  const written = writeCapturedSpark(home, { source, title, body });
+  if (written.status === 'exists') throw new Error(`spark already exists: ${written.filePath}`);
+  return { directory: written.directory, source, spark: written.spark };
+}
+
+// 单条捕获的写入核心（十二轮抽出）：单条/批量共用同一落盘逻辑。
+function writeCapturedSpark(home, { source, title, body }) {
   const directory = sparkDirectory(home);
   fs.mkdirSync(directory, { recursive: true });
   const filePath = path.join(directory, `${sparkSlug(title)}.md`);
-  if (fs.existsSync(filePath)) throw new Error(`spark already exists: ${filePath}`);
+  if (fs.existsSync(filePath)) return { status: 'exists', filePath };
   const date = new Date().toISOString().slice(0, 10);
   fs.writeFileSync(filePath, `---\ntitle: ${title}\ndate: ${date}\nscope: global\nsource: ${source}\n---\n\n# ${title}\n\n${body}\n`);
-  return { directory, source, spark: requireSpark(home, sparkId(filePath)).spark };
+  return { status: 'created', filePath, directory, spark: requireSpark(home, sparkId(filePath)).spark };
+}
+
+// ── 移动壳离线写面（维护包十二轮）：离线队列重放 ──────────────────────────
+// 断网时手机采的火花进快捷指令本地队列，联网后一次性重放回 Mac。重放幂等：
+// 已存在（上次重放过一半断线）按 slug 跳过不报错；单条坏不连坐（其余照入）；
+// 队列文件本身不认（非 JSON/非数组）则零写入拒绝——宁可整批重排不吞半包。
+function captureSparkBatch(home, args) {
+  const batchFile = option(args, '--batch', true);
+  const fallbackSource = option(args, '--source') || 'im';
+  if (!SPARK_CAPTURE_SOURCES.has(fallbackSource)) {
+    throw new Error(`--source must be one of: ${[...SPARK_CAPTURE_SOURCES].join(', ')}`);
+  }
+  let entries;
+  try {
+    entries = JSON.parse(fs.readFileSync(path.resolve(batchFile), 'utf8'));
+  } catch (error) {
+    throw new Error(`cannot read batch file ${batchFile}: ${error.message}`);
+  }
+  if (!Array.isArray(entries) || entries.length === 0) throw new Error('batch file must be a non-empty JSON array of {title, text, source?}');
+  if (entries.length > 200) throw new Error('batch too large (max 200 entries per replay)');
+
+  const results = [];
+  for (const [index, entry] of entries.entries()) {
+    const base = { index };
+    if (typeof entry !== 'object' || entry === null || typeof entry.title !== 'string' || typeof entry.text !== 'string') {
+      results.push({ ...base, title: null, status: 'failed', error: 'entry must be {title: string, text: string, source?: string}' });
+      continue;
+    }
+    const title = entry.title.trim();
+    const body = entry.text.trim();
+    const source = entry.source || fallbackSource;
+    if (!title) { results.push({ ...base, title: entry.title, status: 'failed', error: 'title must not be empty' }); continue; }
+    if (!body) { results.push({ ...base, title, status: 'failed', error: 'text must not be empty' }); continue; }
+    if (!SPARK_CAPTURE_SOURCES.has(source)) { results.push({ ...base, title, status: 'failed', error: `source must be one of: ${[...SPARK_CAPTURE_SOURCES].join(', ')}` }); continue; }
+    try {
+      const written = writeCapturedSpark(home, { source, title, body });
+      results.push(written.status === 'created'
+        ? { ...base, title, status: 'created', source, filePath: written.filePath }
+        : { ...base, title, status: 'skipped-exists', source, filePath: written.filePath });
+    } catch (error) {
+      results.push({ ...base, title, status: 'failed', error: error.message });
+    }
+  }
+  const created = results.filter((r) => r.status === 'created').length;
+  const skipped = results.filter((r) => r.status === 'skipped-exists').length;
+  const failed = results.filter((r) => r.status === 'failed').length;
+  return { batch: path.resolve(batchFile), created, skipped, failed, entries: results };
 }
 
 // ── registry 共享形态（维护心跳包·九轮）：单机 json → 多工作区/团队共享 ──
@@ -2380,7 +2480,7 @@ function registryImport(home, args) {
   });
 }
 
-const USAGE = 'Usage: ks --help | ks init | ks workspace <add|list> | ks spark <configure|list|find|inspect|create|capture|append-section|check> | ks project <create|register|update|list|search|tag|alias|describe|lifecycle|inspect|resolve|check|migrate|adopt|rules> | ks coordination <open|find|resume|archive> | ks chat-room <open|append|archive|split> | ks version <status|init|check|plan|apply> | ks plugin <list|check> | ks workflow <run> | ks market <list|install|upgrade> <name> --source <path|url> [--refresh] [--force] | ks registry <export|import> --file <path> [--force] | ks route [--shell] | ks status [--home <path>] [--json]';
+const USAGE = 'Usage: ks --help | ks init | ks workspace <add|list> | ks spark <configure|list|find|inspect|create|capture|append-section|check> | ks project <create|register|update|list|search|tag|alias|describe|lifecycle|inspect|resolve|check|migrate|adopt|rules> | ks coordination <open|find|resume|archive> | ks chat-room <open|append|archive|split> | ks version <status|init|check|plan|apply> | ks plugin <list|check> | ks workflow <run> | ks market <list|install|upgrade> <name> --source <path|url> [--refresh] [--force] | ks registry <export|import> --file <path> [--force] | ks route [--shell] [--plan <n>] | ks spark capture --batch <file> [--source <im|mail>] | ks status [--home <path>] [--json]';
 
 function main() {
   const args = process.argv.slice(2);
@@ -2665,6 +2765,17 @@ function main() {
   }
 
   if (command === 'route') {
+    // 离线缓存计划（十二轮）：--plan N 只读预演未来 N 步转动——壳联网时同步
+    // 进快捷指令变量，断网照读。不转不动 rotation.json（真转动仍走 ks route）。
+    if (args.includes('--plan')) {
+      const plan = ksRoutePlan(home, args);
+      if (args.includes('--shell')) {
+        for (const step of plan.plan) process.stdout.write(`${step.name}\t${step.path}\n`);
+        return;
+      }
+      printResult({ ok: true, ...plan }, true);
+      return;
+    }
     const outcome = ksRoute(home, args);
     if (args.includes('--shell')) {
       // 移动端壳面（九轮）：单行 name<TAB>path——iOS 快捷指令「Run script over SSH」
@@ -2677,6 +2788,13 @@ function main() {
   }
 
   if (command === 'spark' && args[1] === 'capture') {
+    // 离线队列重放（十二轮）：--batch <file> 幂等回放本地攒的捕获队列。
+    if (args.includes('--batch')) {
+      const replay = captureSparkBatch(home, args);
+      printResult({ ok: replay.failed === 0, ...replay }, true);
+      if (replay.failed > 0) process.exitCode = 1;
+      return;
+    }
     printResult({ ok: true, ...captureSpark(home, args) }, true);
     return;
   }
