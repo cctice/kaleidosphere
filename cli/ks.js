@@ -201,11 +201,15 @@ function sparkDirectory(home) {
 
 function configureSparkDirectory(home, args) {
   const directory = path.resolve(option(args, '--path', true));
-  const { file, registry } = readSparks(home);
-  fs.mkdirSync(directory, { recursive: true });
-  registry.directory = directory;
-  writeJson(file, registry);
-  return { directory, configured: true };
+  // 并发写保护（十二轮）：readSparks→writeJson 是读-改-写，两会话同时 configure
+  // 后写者整体覆盖前写者——与 registry/rotation 同吃 withStateLock。
+  return withStateLock(home, 'sparks', () => {
+    const { file, registry } = readSparks(home);
+    fs.mkdirSync(directory, { recursive: true });
+    registry.directory = directory;
+    writeJson(file, registry);
+    return { directory, configured: true };
+  });
 }
 
 function sparkId(filePath) {
@@ -2324,14 +2328,19 @@ function captureSpark(home, args) {
 }
 
 // 单条捕获的写入核心（十二轮抽出）：单条/批量共用同一落盘逻辑。
+// 并发写保护（十二轮）：existsSync→write 是 TOCTOU——两进程并发 capture 同题
+// 都过存在检查后写，后写者静默覆盖前写者（丢一条火花）。整段挂 withStateLock，
+// 并发同题恰好一胜一负（负者拿到 exists 报错，不再静默覆盖）。
 function writeCapturedSpark(home, { source, title, body }) {
-  const directory = sparkDirectory(home);
-  fs.mkdirSync(directory, { recursive: true });
-  const filePath = path.join(directory, `${sparkSlug(title)}.md`);
-  if (fs.existsSync(filePath)) return { status: 'exists', filePath };
-  const date = new Date().toISOString().slice(0, 10);
-  fs.writeFileSync(filePath, `---\ntitle: ${title}\ndate: ${date}\nscope: global\nsource: ${source}\n---\n\n# ${title}\n\n${body}\n`);
-  return { status: 'created', filePath, directory, spark: requireSpark(home, sparkId(filePath)).spark };
+  return withStateLock(home, 'sparks', () => {
+    const directory = sparkDirectory(home);
+    fs.mkdirSync(directory, { recursive: true });
+    const filePath = path.join(directory, `${sparkSlug(title)}.md`);
+    if (fs.existsSync(filePath)) return { status: 'exists', filePath };
+    const date = new Date().toISOString().slice(0, 10);
+    fs.writeFileSync(filePath, `---\ntitle: ${title}\ndate: ${date}\nscope: global\nsource: ${source}\n---\n\n# ${title}\n\n${body}\n`);
+    return { status: 'created', filePath, directory, spark: requireSpark(home, sparkId(filePath)).spark };
+  });
 }
 
 // ── 移动壳离线写面（维护包十二轮）：离线队列重放 ──────────────────────────
