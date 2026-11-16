@@ -2286,7 +2286,98 @@ function ksRoutePlan(home, args) {
     lifecycle,
     candidates: candidates.length,
     plan: steps,
+    planId: routePlanId(steps, readRotationState(home).state),
+    staleAfterHours: routePlanStaleHours(),
     note: 'deterministic preview of successive ks route picks; read-only, re-sync after any real route'
+  };
+}
+
+// ── 缓存计划新鲜度（维护包十三轮）：壳不算，ks 权威判定 ────────────────────
+// 痛点：壳把 --plan 结果同步进快捷指令变量，断网照读——多老算陈旧、桌面离线期
+// 是否真转过（计划内容过期），此前都要壳侧人算。口径：
+//   - --plan 生成时落 state/plan-cache.json（壳同步即 cat 这份，服务端留档）；
+//   - 陈旧口径：ageHours > KS_PLAN_STALE_HOURS（默认 24，0=关闭不判）；
+//   - 内容口径：planId = 步骤序列+rotation history 长度指纹，真转过即不匹配；
+//   - ks route --plan --status 一条命令回真话：fresh/stale/mismatch 三态+指路。
+function routePlanStaleHours() {
+  const n = Number(process.env.KS_PLAN_STALE_HOURS);
+  return Number.isFinite(n) && n >= 0 ? n : 24;
+}
+
+function routePlanId(steps, rotationState) {
+  return createHash('sha256')
+    .update(JSON.stringify({ steps: steps.map((s) => s.id), history: (rotationState.history || []).length }))
+    .digest('hex').slice(0, 16);
+}
+
+function planCachePath(home) {
+  return path.join(home, 'state', 'plan-cache.json');
+}
+
+function readPlanCache(home) {
+  try {
+    return JSON.parse(fs.readFileSync(planCachePath(home), 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function writePlanCache(home, plan) {
+  const cache = {
+    generatedAt: plan.generatedAt,
+    lifecycle: plan.lifecycle,
+    plan: plan.plan,
+    planId: plan.planId,
+    staleAfterHours: plan.staleAfterHours,
+  };
+  fs.mkdirSync(path.dirname(planCachePath(home)), { recursive: true });
+  fs.writeFileSync(planCachePath(home), JSON.stringify(cache, null, 2) + '\n');
+}
+
+/** --plan --status：缓存计划的真话面——陈旧（age）与内容过期（planId）双口径 ks 判 */
+function ksRoutePlanStatus(home, args) {
+  const cache = readPlanCache(home);
+  if (!cache) {
+    return {
+      cached: false,
+      staleAfterHours: routePlanStaleHours(),
+      hint: 'no plan cached yet; run ks route --plan <n> first (shell then syncs state/plan-cache.json)',
+    };
+  }
+  const ageHours = Math.max(0, (Date.now() - Date.parse(cache.generatedAt)) / 3600000);
+  // 阈值以当前 env 优先（运营可实时调整），无 env 才读缓存存档值
+  const staleHours = process.env.KS_PLAN_STALE_HOURS !== undefined
+    ? routePlanStaleHours()
+    : (cache.staleAfterHours ?? routePlanStaleHours());
+  const stale = staleHours > 0 && ageHours > staleHours;
+  // 内容口径：按缓存口径现算一遍当前 planId——桌面真转过即 mismatch
+  const lifecycle = cache.lifecycle || 'active';
+  const currentArgs = ['--plan', String((cache.plan || []).length || 3), '--lifecycle', lifecycle];
+  let planIdMatches = null;
+  let currentPlanId = null;
+  try {
+    const current = ksRoutePlan(home, currentArgs);
+    currentPlanId = current.planId;
+    planIdMatches = current.planId === cache.planId;
+  } catch {
+    planIdMatches = null; // 项目面变了算不出：如实 null，不装懂
+  }
+  const verdict = planIdMatches === false ? 'mismatch' : stale ? 'stale' : 'fresh';
+  return {
+    cached: true,
+    generatedAt: cache.generatedAt,
+    ageHours: Math.round(ageHours * 10) / 10,
+    staleAfterHours: staleHours,
+    stale,
+    planId: cache.planId,
+    currentPlanId,
+    planIdMatches,
+    verdict,
+    hint: verdict === 'fresh'
+      ? 'cache is fresh and still matches current rotation state; safe to use offline'
+      : verdict === 'stale'
+        ? `cache is ${Math.round(ageHours)}h old (limit ${staleHours}h); re-sync with ks route --plan`
+        : 'rotation advanced since sync; plan content is outdated — re-sync with ks route --plan',
   };
 }
 
@@ -2387,7 +2478,75 @@ function captureSparkBatch(home, args) {
   const created = results.filter((r) => r.status === 'created').length;
   const skipped = results.filter((r) => r.status === 'skipped-exists').length;
   const failed = results.filter((r) => r.status === 'failed').length;
-  return { batch: path.resolve(batchFile), created, skipped, failed, entries: results };
+  // 失败留痕（十三轮）：重放报告只在响应面——回放方（快捷指令）自己不记账，
+  // 失败条目终端一滚就没了。失败条目落 state/replay-todo.json 本地待办
+  // （键=batch 文件+index，重放成功即销账；封顶 500 防"只增不删"），
+  // --show-todo 随时可回看，响应面带 todoPending 计数指路。
+  const todoPending = recordReplayTodo(home, path.resolve(batchFile), entries, results);
+  return { batch: path.resolve(batchFile), created, skipped, failed, entries: results, ...(todoPending > 0 ? { todoPending, todoHint: 'failed entries kept in state/replay-todo.json; view with ks spark capture --show-todo' } : {}) };
+}
+
+// ── 回放失败待办（维护包十三轮）：重放方自己不记账，ks 替它记 ──────────────
+const REPLAY_TODO_LIMIT = 500;
+
+function replayTodoPath(home) {
+  return path.join(home, 'state', 'replay-todo.json');
+}
+
+function readReplayTodo(home) {
+  try {
+    return JSON.parse(fs.readFileSync(replayTodoPath(home), 'utf8'));
+  } catch {
+    return { pending: [] };
+  }
+}
+
+function recordReplayTodo(home, batchFile, entries, results) {
+  const todo = readReplayTodo(home);
+  const key = (file, index) => `${file}#${index}`;
+  for (const result of results) {
+    const k = key(batchFile, result.index);
+    if (result.status === 'failed') {
+      // 幂等留痕：同批同条目上次已失败在办，不重复堆积（at 不刷新，保留首败时间）
+      if (todo.pending.some((item) => key(item.batch, item.index) === k)) continue;
+      const entry = entries[result.index];
+      todo.pending.push({
+        batch: batchFile,
+        index: result.index,
+        title: result.title ?? null,
+        error: result.error,
+        entry: typeof entry === 'object' && entry !== null ? entry : null,
+        at: new Date().toISOString(),
+      });
+    } else {
+      // 本条回放成功（created/skipped）即销账：上次失败的条目这次过了就出队
+      todo.pending = todo.pending.filter((item) => key(item.batch, item.index) !== k);
+    }
+  }
+  todo.pending = todo.pending.slice(-REPLAY_TODO_LIMIT); // 有界：最旧的失败先让位
+  todo.updatedAt = new Date().toISOString();
+  fs.mkdirSync(path.dirname(replayTodoPath(home)), { recursive: true });
+  fs.writeFileSync(replayTodoPath(home), JSON.stringify(todo, null, 2) + '\n');
+  return todo.pending.length;
+}
+
+function showReplayTodo(home) {
+  const todo = readReplayTodo(home);
+  const byBatch = new Map();
+  for (const item of todo.pending) {
+    if (!byBatch.has(item.batch)) byBatch.set(item.batch, []);
+    byBatch.get(item.batch).push(item);
+  }
+  return {
+    pending: todo.pending.length,
+    updatedAt: todo.updatedAt ?? null,
+    batches: [...byBatch.entries()].map(([batch, items]) => ({
+      batch,
+      failed: items.length,
+      entries: items.map(({ title, index, error, at }) => ({ index, title, error, at })),
+    })),
+    ...(todo.pending.length === 0 ? { note: 'no failed replay entries; queue is fully drained' } : {}),
+  };
 }
 
 // ── registry 共享形态（维护心跳包·九轮）：单机 json → 多工作区/团队共享 ──
@@ -2489,7 +2648,7 @@ function registryImport(home, args) {
   });
 }
 
-const USAGE = 'Usage: ks --help | ks init | ks workspace <add|list> | ks spark <configure|list|find|inspect|create|capture|append-section|check> | ks project <create|register|update|list|search|tag|alias|describe|lifecycle|inspect|resolve|check|migrate|adopt|rules> | ks coordination <open|find|resume|archive> | ks chat-room <open|append|archive|split> | ks version <status|init|check|plan|apply> | ks plugin <list|check> | ks workflow <run> | ks market <list|install|upgrade> <name> --source <path|url> [--refresh] [--force] | ks registry <export|import> --file <path> [--force] | ks route [--shell] [--plan <n>] | ks spark capture --batch <file> [--source <im|mail>] | ks status [--home <path>] [--json]';
+const USAGE = 'Usage: ks --help | ks init | ks workspace <add|list> | ks spark <configure|list|find|inspect|create|capture|append-section|check> | ks project <create|register|update|list|search|tag|alias|describe|lifecycle|inspect|resolve|check|migrate|adopt|rules> | ks coordination <open|find|resume|archive> | ks chat-room <open|append|archive|split> | ks version <status|init|check|plan|apply> | ks plugin <list|check> | ks workflow <run> | ks market <list|install|upgrade> <name> --source <path|url> [--refresh] [--force] | ks registry <export|import> --file <path> [--force] | ks route [--shell] [--plan <n>] [--plan --status] | ks spark capture --batch <file> [--source <im|mail>] | ks spark capture --show-todo | ks status [--home <path>] [--json]';
 
 function main() {
   const args = process.argv.slice(2);
@@ -2777,7 +2936,15 @@ function main() {
     // 离线缓存计划（十二轮）：--plan N 只读预演未来 N 步转动——壳联网时同步
     // 进快捷指令变量，断网照读。不转不动 rotation.json（真转动仍走 ks route）。
     if (args.includes('--plan')) {
+      // 缓存新鲜度（十三轮）：--plan --status 权威判定壳缓存还能不能用——
+      // 陈旧（age>staleAfterHours）与内容过期（真转过 route，planId 不匹配）
+      // 双口径由 ks 判，壳不用自己算新鲜度。
+      if (args.includes('--status')) {
+        printResult({ ok: true, ...ksRoutePlanStatus(home, args) }, true);
+        return;
+      }
       const plan = ksRoutePlan(home, args);
+      writePlanCache(home, plan); // 服务端留档：壳同步这份缓存，新鲜度由 --status 权威判定
       if (args.includes('--shell')) {
         for (const step of plan.plan) process.stdout.write(`${step.name}\t${step.path}\n`);
         return;
@@ -2802,6 +2969,11 @@ function main() {
       const replay = captureSparkBatch(home, args);
       printResult({ ok: replay.failed === 0, ...replay }, true);
       if (replay.failed > 0) process.exitCode = 1;
+      return;
+    }
+    // 失败待办回看（十三轮）：上次回放失败的条目随时可查（重放方不记账，ks 记）。
+    if (args.includes('--show-todo')) {
+      printResult({ ok: true, ...showReplayTodo(home) }, true);
       return;
     }
     printResult({ ok: true, ...captureSpark(home, args) }, true);

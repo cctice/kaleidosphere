@@ -68,6 +68,10 @@ node /path/to/kaleidosphere/cli/ks.js route --plan 5 --json
    长按也有答案，Mac 不在场也不白屏。
 3. `--plan` 是只读预演：rotation.json 分毫不动；桌面端离线期间真转过则计划
    过期——`generatedAt` 如实展示，不冒充实时。重新联网跑一次「KS 同步」即刷新。
+4. 缓存新鲜度不用人算（十三轮）：联网后跑一次 `ks route --plan --status`——
+   `verdict: fresh | stale | mismatch` 三态真话（age 超阈值=stale；桌面真转过
+   planId 不匹配=mismatch），`hint` 直接给下一步；阈值 `KS_PLAN_STALE_HOURS`
+   （默认 24，0=关闭 age 判定，内容口径 planId 仍看守）。显示缓存前先问一次。
 
 ### 写面：离线队列重放（`ks spark capture --batch`）
 
@@ -85,6 +89,9 @@ node /path/to/kaleidosphere/cli/ks.js route --plan 5 --json
 3. 回放幂等：已存在（上次回放到一半断线）按 slug 跳过不报错，报告里
    `created/skipped-exists/failed` 三态逐条可见；单条坏不连坐；队列文件
    本身不认则零写入整批拒绝。成功后清空本地队列。
+4. 失败留痕不用回放方记账（十三轮）：失败条目自动落 Mac 侧
+   `state/replay-todo.json`（title/error/原始条目随行，封顶 500），下次重放
+   成功即销账；随时 `ks spark capture --show-todo` 回看待办。
 
 ### 边界（如实·第二步后）
 
