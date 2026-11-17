@@ -85,3 +85,48 @@ test('失败条目有界：封顶 500 最旧让位（只增不删的病不进待
   assert.equal(todo.pending[499].title, '', '最新失败在队尾');
   assert.equal(todo.pending[0].index, 11, '最旧的 10 条让位');
 });
+
+// ── 消化提醒面（维护心跳包·十四轮）：待办要主动出现在例行输出里 ────────────
+// 痛点：--show-todo 是被动回看——有待办不会点名，消化永远差一次"想起来去看"。
+// 现在两处主动捎带：status 例行点名（reminders + replayTodo 摘要面）、
+// route 顺路捎带（todoPending）；--shell 单行面契约不动；消化后自动安静。
+
+test('status 点名待办：replayTodo 摘要 + reminders 指路；消化后自动安静', () => {
+  const home = setupHome();
+  const queue = join(home, 'queue.json');
+  writeFileSync(queue, JSON.stringify([{ title: '', text: 'x' }]), 'utf8');
+  runKs(['spark', 'capture', '--batch', queue, '--home', home]); // 制造 1 条待办
+
+  const status = JSON.parse(runKs(['status', '--home', home]).stdout);
+  assert.equal(status.replayTodo.pending, 1, '状态面带待办摘要');
+  assert.ok(status.replayTodo.oldestAt, '最早失败时间随行');
+  assert.match(status.replayTodo.viewCommand, /--show-todo/);
+  const reminder = status.reminders.find((r) => r.command.includes('--show-todo'));
+  assert.ok(reminder, 'reminders 点名消化命令');
+  assert.match(reminder.why, /1 条回放失败待办/);
+
+  // 修好重放 → 待办销账 → status 自动安静
+  writeFileSync(queue, JSON.stringify([{ title: '补好了', text: 'y' }]), 'utf8');
+  runKs(['spark', 'capture', '--batch', queue, '--home', home]);
+  const after = JSON.parse(runKs(['status', '--home', home]).stdout);
+  assert.equal(after.replayTodo.pending, 0, '消化后归零');
+  assert.equal(after.replayTodo.oldestAt, null);
+  assert.ok(!after.reminders.some((r) => r.command.includes('--show-todo')), '消化后不再点名');
+});
+
+test('route 顺路捎带待办：todoPending 指路；--shell 单行面契约不动', () => {
+  const home = setupHome();
+  const queue = join(home, 'queue.json');
+  writeFileSync(queue, JSON.stringify([{ title: '', text: 'x' }]), 'utf8');
+  runKs(['spark', 'capture', '--batch', queue, '--home', home]); // 1 条待办在办
+  assert.equal(runKs(['workspace', 'add', '--home', home, '--id', 'work', '--path', join(home, 'work')]).status, 0);
+  assert.equal(runKs(['project', 'create', '--home', home, '--workspace', 'work', '--name', 'alpha']).status, 0);
+
+  const routed = JSON.parse(runKs(['route', '--home', home]).stdout);
+  assert.equal(routed.todoPending, 1, 'route 响应面捎带待办计数');
+  assert.match(routed.todoHint, /--show-todo/);
+
+  const shell = runKs(['route', '--shell', '--home', home]);
+  assert.equal(shell.status, 0);
+  assert.match(shell.stdout.trim(), /^[^\t]+\t[^\t]+$/, '--shell 仍是单行 name<TAB>path，不带待办噪声');
+});

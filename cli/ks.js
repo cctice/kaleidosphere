@@ -1877,7 +1877,17 @@ function ksStatus(home) {
       reminders.push({ command: 'ks route', why: `${active.length} 个活跃项目停转 ${idleDays === null ? '从未转动' : `${idleDays} 天`}（阈值 ${remindAfterDays} 天）——该换下一块玻璃了` });
     }
   }
-  return { pillars: view.pillars, sparksConfigured: view.sparksConfigured, rotation, reminders, onboarding: { complete: nextSteps.length === 0, nextSteps } };
+  // 回放待办消化提醒（维护包十四轮）：--show-todo 有了，但"有待办"此前不会
+  // 主动出现在任何常规输出里——待办只有回放失败当场被点名一次，之后无人再看。
+  // status 是例行面：有待办即点名（多少条/最早何时），消化后自动安静。
+  const replayTodo = replayTodoSummary(home);
+  if (replayTodo.pending > 0) {
+    reminders.push({
+      command: 'ks spark capture --show-todo',
+      why: `${replayTodo.pending} 条回放失败待办未消化（最早 ${replayTodo.oldestAt}）——离线队列里有漏网火花`
+    });
+  }
+  return { pillars: view.pillars, sparksConfigured: view.sparksConfigured, rotation, replayTodo, reminders, onboarding: { complete: nextSteps.length === 0, nextSteps } };
 }
 
 // ── 插件市场接线（维护包四轮：P4 支柱对接 workflow-party 清单）──────────────
@@ -2241,7 +2251,16 @@ function ksRoute(home, args) {
     const upcoming = ranked.slice(1, 3).map((project) => project.name);
     return { selected, upcoming, historySize: state.history.length };
   });
-  return { project: outcome.selected, rotated: candidates.length > 1, upcoming: outcome.upcoming, historySize: outcome.historySize };
+  // 顺路捎带（维护包十四轮）：转动是最高频的人工触点——有待办不点名，
+  // 消化就永远差一次"想起来去看"。--shell 单行面不动（name<TAB>path 契约）。
+  const todo = replayTodoSummary(home);
+  return {
+    project: outcome.selected,
+    rotated: candidates.length > 1,
+    upcoming: outcome.upcoming,
+    historySize: outcome.historySize,
+    ...(todo.pending > 0 ? { todoPending: todo.pending, todoHint: `${todo.pending} failed replay entries pending; view with ks spark capture --show-todo` } : {}),
+  };
 }
 
 // ── 移动壳离线读面（维护包十二轮）：缓存计划 ──────────────────────────────
@@ -2546,6 +2565,18 @@ function showReplayTodo(home) {
       entries: items.map(({ title, index, error, at }) => ({ index, title, error, at })),
     })),
     ...(todo.pending.length === 0 ? { note: 'no failed replay entries; queue is fully drained' } : {}),
+  };
+}
+
+// 消化提醒面（维护包十四轮）：待办数摘要——status 例行点名 + route 顺路捎带。
+// 只读真源不猜：无档/空档如实 pending=0，最早失败时间随行（老不老一眼可见）。
+function replayTodoSummary(home) {
+  const todo = readReplayTodo(home);
+  const pending = todo.pending.length;
+  return {
+    pending,
+    oldestAt: pending > 0 ? todo.pending.reduce((min, item) => (item.at && item.at < min ? item.at : min), todo.pending[0]?.at ?? null) : null,
+    viewCommand: 'ks spark capture --show-todo',
   };
 }
 
