@@ -256,15 +256,28 @@ function requireSpark(home, id) {
 }
 
 function findSparks(home, args) {
-  const query = option(args, '--query', true).toLocaleLowerCase();
+  // 十八轮：多词 AND 检索 + 命中上下文/对账面——此前单串 substring，
+  // "网络 代理" 这类两词查询一个都命不中；返回面只有过滤列表没有命中账。
+  const raw = option(args, '--query', true);
+  const terms = raw.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
   const result = listSparks(home);
-  return {
-    ...result,
-    sparks: result.sparks.filter((spark) => {
-      const content = fs.readFileSync(spark.path, 'utf8').toLocaleLowerCase();
-      return `${spark.title}\n${spark.path}\n${content}`.toLocaleLowerCase().includes(query);
-    })
-  };
+  const sparks = [];
+  for (const spark of result.sparks) {
+    const content = fs.readFileSync(spark.path, 'utf8').toLocaleLowerCase();
+    const haystack = `${spark.title}\n${spark.path}\n${content}`.toLocaleLowerCase();
+    if (!terms.every((term) => haystack.includes(term))) continue;
+    let snippet = null;
+    const first = terms.find((term) => haystack.includes(term));
+    if (first) {
+      const idx = haystack.indexOf(first);
+      snippet = haystack
+        .slice(Math.max(0, idx - 40), idx + 60)
+        .replace(/\s+/g, ' ')
+        .trim();
+    }
+    sparks.push({ ...spark, snippet });
+  }
+  return { ...result, query: raw, scannedSparks: result.sparks.length, matchedSparks: sparks.length, sparks };
 }
 
 function inspectSpark(home, args) {
@@ -273,7 +286,17 @@ function inspectSpark(home, args) {
 }
 
 function sparkSlug(title) {
-  const slug = title.toLocaleLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  // 十八轮：unicode 感知 slug——此前 [^a-z0-9] 把 CJK 全剥掉，中文标题一律落
+  // spark-<hash>.md（真库里 10 条有 1 条哈希脸，人找文件只能靠 id）。NFKD 归一
+  // （全角→半角）+ \p{L}\p{N} 保留所有语言字母数字；长度封顶 64 字符（macOS
+  // 文件名 255 字节，CJK 每字 3 字节留足余量）；纯符号标题退回哈希（原口径）。
+  const normalized = title.normalize('NFKD').replace(/[\u0300-\u036f]/g, '');
+  const slug = normalized
+    .toLocaleLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 64)
+    .replace(/-+$/g, '');
   return slug || `spark-${createHash('sha256').update(title).digest('hex').slice(0, 12)}`;
 }
 
