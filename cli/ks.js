@@ -216,11 +216,30 @@ function sparkId(filePath) {
   return `spk_${createHash('sha256').update(path.resolve(filePath)).digest('hex').slice(0, 16)}`;
 }
 
+// ── 标签账（维护包二十三轮，消化二十二轮留题）─────────────────────────────
+// 留题原文："spark frontmatter 无 tags 字段（--tag 过滤是先建账再过滤的题，两步
+// 分开）"。本轮两步一并补：create --tag 落 YAML 流式列表 tags: [a, b]（建账）；
+// list/find --tag 按 frontmatter tags 过滤（消费账）。多 --tag 取 AND——与
+// find 多词 AND（十八轮）同口径：标签求交是"既打了 A 又打了 B"的精确取子集，
+// OR 会把子集越取越大，不合检索直觉。
+// 旧火花（无 tags 字段）→ 读作 []，天然不命中 --tag 过滤（不迁移不报错，
+// scope 兜底口径同款）；--tag 过滤是纯读面，读不出标签不算错误。
+function parseSparkTags(raw) {
+  // 流式列表 [a, b, c] 按逗号切；兼容手写裸值 tags: foo（单标签）与引号形态
+  // tags: ['网络', '代理']（剥引号）；无字段/空列表 → []。
+  if (!raw) return [];
+  const inner = raw.startsWith('[') && raw.endsWith(']') ? raw.slice(1, -1) : raw;
+  return inner
+    .split(',')
+    .map((tag) => tag.trim().replace(/^['"]+|['"]+$/g, '').trim())
+    .filter(Boolean);
+}
+
 function sparkFrontMatter(content) {
   const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
   if (!match) return {};
   const read = (key) => match[1].match(new RegExp(`^${key}:\\s*(.+)$`, 'm'))?.[1]?.trim() || null;
-  return { title: read('title'), date: read('date'), scope: read('scope'), source: read('source') };
+  return { title: read('title'), date: read('date'), scope: read('scope'), source: read('source'), tags: parseSparkTags(read('tags')) };
 }
 
 function listSparks(home) {
@@ -241,6 +260,7 @@ function listSparks(home) {
         date: metadata.date,
         scope: metadata.scope || 'global',
         source: metadata.source || null,
+        tags: metadata.tags,
         updatedAt: stat.mtime.toISOString()
       };
     })
@@ -269,12 +289,18 @@ function parseSparkFilter(args) {
     limit = Number(limitRaw);
     if (!Number.isInteger(limit) || limit < 1) throw new Error('--limit must be a positive integer');
   }
-  return { scope, limit };
+  // 二十三轮：--tag 可多次，多值取 AND（见 parseSparkTags 头注）；空值宁红勿默
+  const tags = options(args, '--tag').map((tag) => tag.trim());
+  if (tags.includes('')) throw new Error('--tag must not be empty');
+  return { scope, limit, tags };
 }
 
 function applySparkFilter(sparks, filter) {
   let rows = sparks;
   if (filter.scope !== undefined) rows = rows.filter((spark) => spark.scope === filter.scope);
+  if (filter.tags && filter.tags.length > 0) {
+    rows = rows.filter((spark) => filter.tags.every((tag) => (spark.tags || []).includes(tag)));
+  }
   const totalSparks = rows.length;
   let truncated = false;
   if (filter.limit !== null && rows.length > filter.limit) {
@@ -289,13 +315,13 @@ function findSparks(home, args) {
   // "网络 代理" 这类两词查询一个都命不中；返回面只有过滤列表没有命中账。
   // 二十二轮：--scope 先滤后扫（scannedSparks 反映 scope 过滤后的扫描面）、
   // --limit 封顶匹配结果（truncated 随行）——大库不把无关 scope 翻一遍。
+  // 二十三轮：--tag 与 --scope 同款先滤后扫（scannedSparks 反映 scope+tag
+  // 过滤后的扫描面；复用 applySparkFilter 同一谓词，AND 语义单一真源）。
   const raw = option(args, '--query', true);
   const terms = raw.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
   const filter = parseSparkFilter(args);
   const result = listSparks(home);
-  const scoped = filter.scope !== undefined
-    ? result.sparks.filter((spark) => spark.scope === filter.scope)
-    : result.sparks;
+  const scoped = applySparkFilter(result.sparks, { scope: filter.scope, tags: filter.tags, limit: null }).rows;
   const sparks = [];
   for (const spark of scoped) {
     const content = fs.readFileSync(spark.path, 'utf8').toLocaleLowerCase();
@@ -312,11 +338,13 @@ function findSparks(home, args) {
     }
     sparks.push({ ...spark, snippet });
   }
-  const limited = applySparkFilter(sparks, { scope: undefined, limit: filter.limit });
+  // scoped 已过 scope/tag 滤，这里只做 --limit 封顶（再过一遍滤是恒等，不重复算）
+  const limited = applySparkFilter(sparks, { scope: undefined, tags: [], limit: filter.limit });
   return {
     ...result,
     query: raw,
     scope: filter.scope ?? null,
+    tags: filter.tags.length > 0 ? filter.tags : null,
     scannedSparks: scoped.length,
     matchedSparks: sparks.length,
     totalSparks: limited.totalSparks,
@@ -345,15 +373,33 @@ function sparkSlug(title) {
   return slug || `spark-${createHash('sha256').update(title).digest('hex').slice(0, 12)}`;
 }
 
+// create 面 --tag（可多次）入账校验：trim 后空值宁红勿默；, [ ] ' " 与换行会
+// 破坏流式列表的落账/回读闭环（parseSparkTags 按逗号切、按引号剥、按行定位），
+// 一律拒绝；内部空格合法（多词标签）；重复 tag 去重保序（落账干净）。
+function collectSparkTagInput(args) {
+  const tags = [];
+  for (const raw of options(args, '--tag')) {
+    const tag = raw.trim();
+    if (!tag) throw new Error('--tag must not be empty');
+    if (/[,[\]'"\r\n]/.test(tag)) throw new Error('--tag must not contain commas, brackets, quotes, or line breaks');
+    if (!tags.includes(tag)) tags.push(tag);
+  }
+  return tags;
+}
+
 function createSpark(home, args) {
   const title = option(args, '--title', true).trim();
   if (!title) throw new Error('--title must not be empty');
+  const tags = collectSparkTagInput(args);
   const directory = sparkDirectory(home);
   fs.mkdirSync(directory, { recursive: true });
   const filePath = path.join(directory, `${sparkSlug(title)}.md`);
   if (fs.existsSync(filePath)) throw new Error(`spark already exists: ${filePath}`);
   const date = new Date().toISOString().slice(0, 10);
-  fs.writeFileSync(filePath, `---\ntitle: ${title}\ndate: ${date}\nscope: global\n---\n\n# ${title}\n`);
+  // 无 --tag 不落 tags 行——与旧火花同款 frontmatter（不留空账字段）
+  const frontMatter = [`title: ${title}`, `date: ${date}`, 'scope: global'];
+  if (tags.length > 0) frontMatter.push(`tags: [${tags.join(', ')}]`);
+  fs.writeFileSync(filePath, `---\n${frontMatter.join('\n')}\n---\n\n# ${title}\n`);
   return { directory, spark: requireSpark(home, sparkId(filePath)).spark };
 }
 
@@ -2766,7 +2812,7 @@ function registryImport(home, args) {
   });
 }
 
-const USAGE = 'Usage: ks --help | ks init | ks workspace <add|list> | ks spark <configure|list|find|inspect|create|capture|append-section|check|rm> | ks spark list/find --scope <scope> --limit <n> | ks spark rm --id <id> | ks project <create|register|update|list|search|tag|alias|describe|lifecycle|inspect|resolve|check|migrate|adopt|rules> | ks coordination <open|find|resume|archive> | ks chat-room <open|append|archive|split> | ks version <status|init|check|plan|apply> | ks plugin <list|check> | ks workflow <run> | ks market <list|install|upgrade> <name> --source <path|url> [--refresh] [--force] | ks registry <export|import> --file <path> [--force] | ks route [--shell] [--plan <n>] [--plan --status] | ks spark capture --batch <file> [--source <im|mail>] | ks spark capture --show-todo | ks status [--home <path>] [--json]';
+const USAGE = 'Usage: ks --help | ks init | ks workspace <add|list> | ks spark <configure|list|find|inspect|create|capture|append-section|check|rm> | ks spark list/find --scope <scope> --tag <t> [--tag <t> AND] --limit <n> | ks spark create --title <t> [--tag <t>...] | ks spark rm --id <id> | ks project <create|register|update|list|search|tag|alias|describe|lifecycle|inspect|resolve|check|migrate|adopt|rules> | ks coordination <open|find|resume|archive> | ks chat-room <open|append|archive|split> | ks version <status|init|check|plan|apply> | ks plugin <list|check> | ks workflow <run> | ks market <list|install|upgrade> <name> --source <path|url> [--refresh] [--force] | ks registry <export|import> --file <path> [--force] | ks route [--shell] [--plan <n>] [--plan --status] | ks spark capture --batch <file> [--source <im|mail>] | ks spark capture --show-todo | ks status [--home <path>] [--json]';
 
 function main() {
   const args = process.argv.slice(2);
@@ -2804,10 +2850,11 @@ function main() {
 
   if (command === 'spark' && args[1] === 'list') {
     // 过滤面（二十二轮）：--scope 精确取子集、--limit 封顶——对账面（totalSparks/truncated）随行不省略
+    // 二十三轮：--tag 按 frontmatter tags 过滤（可多次取 AND，见 parseSparkTags 头注）
     const filter = parseSparkFilter(args);
     const base = listSparks(home);
     const filtered = applySparkFilter(base.sparks, filter);
-    printResult({ ok: true, directory: base.directory, scope: filter.scope ?? null, totalSparks: filtered.totalSparks, truncated: filtered.truncated, sparks: filtered.rows }, true);
+    printResult({ ok: true, directory: base.directory, scope: filter.scope ?? null, tags: filter.tags.length > 0 ? filter.tags : null, totalSparks: filtered.totalSparks, truncated: filtered.truncated, sparks: filtered.rows }, true);
     return;
   }
 
