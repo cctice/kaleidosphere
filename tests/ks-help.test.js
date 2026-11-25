@@ -25,7 +25,9 @@ test('usage line documents every command group, including spark', () => {
   for (const group of ['init', 'workspace', 'spark', 'project', 'coordination', 'chat-room', 'version']) {
     assert.ok(help.stdout.includes(`ks ${group}`), `usage must mention the "${group}" group`);
   }
-  assert.match(help.stdout, /ks spark <configure\|list\|find\|inspect\|create\|capture\|append-section\|check>/);
+  // 二十二轮：spark 组扩到 10 个子命令（+rm），过滤面（--scope/--limit）进总纲
+  assert.match(help.stdout, /ks spark <configure\|list\|find\|inspect\|create\|capture\|append-section\|check\|rm>/);
+  assert.match(help.stdout, /ks spark list\/find --scope <scope> --limit <n>/);
   assert.match(help.stdout, /--home <path>/);
   assert.match(help.stdout, /--json/);
 });

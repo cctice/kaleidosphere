@@ -255,14 +255,49 @@ function requireSpark(home, id) {
   return { ...result, spark };
 }
 
+// ── 检索过滤面（维护包二十二轮）─────────────────────────────────────────
+// 痛点：list/find 只能全量扫——真实库 scope 有非 global 值（"跨模块发布需求"等），
+// 知识库长大以后按 scope 取子集/封顶条数是检索刚需。--scope 按 frontmatter scope
+// 精确匹配（缺元信息按 'global' 兜底，与 listSparks 同口径）；--limit 封顶条数。
+// 过滤是纯读面，但对账不省略：totalSparks（scope 过滤后、封顶前的总数）与
+// truncated（是否被 --limit 截断）随行，消费方看得见自己拿到的是不是全量。
+function parseSparkFilter(args) {
+  const scope = option(args, '--scope');
+  const limitRaw = option(args, '--limit');
+  let limit = null;
+  if (limitRaw !== undefined) {
+    limit = Number(limitRaw);
+    if (!Number.isInteger(limit) || limit < 1) throw new Error('--limit must be a positive integer');
+  }
+  return { scope, limit };
+}
+
+function applySparkFilter(sparks, filter) {
+  let rows = sparks;
+  if (filter.scope !== undefined) rows = rows.filter((spark) => spark.scope === filter.scope);
+  const totalSparks = rows.length;
+  let truncated = false;
+  if (filter.limit !== null && rows.length > filter.limit) {
+    rows = rows.slice(0, filter.limit);
+    truncated = true;
+  }
+  return { rows, totalSparks, truncated };
+}
+
 function findSparks(home, args) {
   // 十八轮：多词 AND 检索 + 命中上下文/对账面——此前单串 substring，
   // "网络 代理" 这类两词查询一个都命不中；返回面只有过滤列表没有命中账。
+  // 二十二轮：--scope 先滤后扫（scannedSparks 反映 scope 过滤后的扫描面）、
+  // --limit 封顶匹配结果（truncated 随行）——大库不把无关 scope 翻一遍。
   const raw = option(args, '--query', true);
   const terms = raw.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
+  const filter = parseSparkFilter(args);
   const result = listSparks(home);
+  const scoped = filter.scope !== undefined
+    ? result.sparks.filter((spark) => spark.scope === filter.scope)
+    : result.sparks;
   const sparks = [];
-  for (const spark of result.sparks) {
+  for (const spark of scoped) {
     const content = fs.readFileSync(spark.path, 'utf8').toLocaleLowerCase();
     const haystack = `${spark.title}\n${spark.path}\n${content}`.toLocaleLowerCase();
     if (!terms.every((term) => haystack.includes(term))) continue;
@@ -277,7 +312,17 @@ function findSparks(home, args) {
     }
     sparks.push({ ...spark, snippet });
   }
-  return { ...result, query: raw, scannedSparks: result.sparks.length, matchedSparks: sparks.length, sparks };
+  const limited = applySparkFilter(sparks, { scope: undefined, limit: filter.limit });
+  return {
+    ...result,
+    query: raw,
+    scope: filter.scope ?? null,
+    scannedSparks: scoped.length,
+    matchedSparks: sparks.length,
+    totalSparks: limited.totalSparks,
+    truncated: limited.truncated,
+    sparks: limited.rows,
+  };
 }
 
 function inspectSpark(home, args) {
@@ -346,6 +391,25 @@ function checkSpark(home, args) {
     { id: 'content.heading', passed: Boolean(heading), message: '火花文件包含一级标题。' }
   ];
   return { directory, spark, compliant: checks.every((check) => check.passed), checks };
+}
+
+// ── 内容生命周期（维护包二十二轮）─────────────────────────────────────────
+// 痛点：spark 写面只有 create/append——只进不出，错字/过时火花无法下架，
+// 知识库只剩"手动找文件 rm"一条歪路。ks spark rm 不删档：移入
+// <sparks>/.trash/<name>-<UTC 时间戳>.md（list/find 天然不再见，误删可手工找回）；
+// 整段挂 withStateLock 与 capture 同款——rm 与 create 并发不互踩（rename 与
+// existsSync 竞争窗口锁内归一）。同标题火花 rm 后可重建（trash 不挡名）。
+function removeSpark(home, args) {
+  const id = option(args, '--id', true);
+  return withStateLock(home, 'sparks', () => {
+    const { directory, spark } = requireSpark(home, id);
+    const trashDir = path.join(directory, '.trash');
+    fs.mkdirSync(trashDir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const trashPath = path.join(trashDir, `${path.basename(spark.path, '.md')}-${stamp}.md`);
+    fs.renameSync(spark.path, trashPath);
+    return { directory, removed: { id: spark.id, title: spark.title, path: spark.path }, trashPath };
+  });
 }
 
 function runGit(cwd, args) {
@@ -2702,7 +2766,7 @@ function registryImport(home, args) {
   });
 }
 
-const USAGE = 'Usage: ks --help | ks init | ks workspace <add|list> | ks spark <configure|list|find|inspect|create|capture|append-section|check> | ks project <create|register|update|list|search|tag|alias|describe|lifecycle|inspect|resolve|check|migrate|adopt|rules> | ks coordination <open|find|resume|archive> | ks chat-room <open|append|archive|split> | ks version <status|init|check|plan|apply> | ks plugin <list|check> | ks workflow <run> | ks market <list|install|upgrade> <name> --source <path|url> [--refresh] [--force] | ks registry <export|import> --file <path> [--force] | ks route [--shell] [--plan <n>] [--plan --status] | ks spark capture --batch <file> [--source <im|mail>] | ks spark capture --show-todo | ks status [--home <path>] [--json]';
+const USAGE = 'Usage: ks --help | ks init | ks workspace <add|list> | ks spark <configure|list|find|inspect|create|capture|append-section|check|rm> | ks spark list/find --scope <scope> --limit <n> | ks spark rm --id <id> | ks project <create|register|update|list|search|tag|alias|describe|lifecycle|inspect|resolve|check|migrate|adopt|rules> | ks coordination <open|find|resume|archive> | ks chat-room <open|append|archive|split> | ks version <status|init|check|plan|apply> | ks plugin <list|check> | ks workflow <run> | ks market <list|install|upgrade> <name> --source <path|url> [--refresh] [--force] | ks registry <export|import> --file <path> [--force] | ks route [--shell] [--plan <n>] [--plan --status] | ks spark capture --batch <file> [--source <im|mail>] | ks spark capture --show-todo | ks status [--home <path>] [--json]';
 
 function main() {
   const args = process.argv.slice(2);
@@ -2739,7 +2803,11 @@ function main() {
   }
 
   if (command === 'spark' && args[1] === 'list') {
-    printResult({ ok: true, ...listSparks(home) }, true);
+    // 过滤面（二十二轮）：--scope 精确取子集、--limit 封顶——对账面（totalSparks/truncated）随行不省略
+    const filter = parseSparkFilter(args);
+    const base = listSparks(home);
+    const filtered = applySparkFilter(base.sparks, filter);
+    printResult({ ok: true, directory: base.directory, scope: filter.scope ?? null, totalSparks: filtered.totalSparks, truncated: filtered.truncated, sparks: filtered.rows }, true);
     return;
   }
 
@@ -2765,6 +2833,11 @@ function main() {
 
   if (command === 'spark' && args[1] === 'check') {
     printResult({ ok: true, ...checkSpark(home, args) }, true);
+    return;
+  }
+
+  if (command === 'spark' && args[1] === 'rm') {
+    printResult({ ok: true, ...removeSpark(home, args) }, true);
     return;
   }
 
