@@ -7,6 +7,9 @@
 //   ③ find --tag 先滤后扫——scannedSparks 反映 tag 过滤后的扫描面，不翻无关子集；
 //   ④ 多 --tag 取 AND——与 find 多词 AND（十八轮）同口径；
 //   ⑤ 旧火花（无 tags 字段）天然不命中 --tag 过滤——不迁移不报错，plain 面照常。
+//
+// 二十四轮扩面：capture 是 spark 写面第三入口（单条 --tag + 离线队列 tags 字段），
+// 与 create 同一收集器/同一字符规则/同一落账格式——移动壳采的火花不必回桌面补标签账。
 const assert = require('node:assert/strict');
 const { mkdtempSync, mkdirSync, writeFileSync, readFileSync } = require('node:fs');
 const { tmpdir } = require('node:os');
@@ -173,4 +176,75 @@ test('ks spark rejects bad --tag values instead of guessing (宁红勿默)', () 
   // 坏值零落档：以上 create 全被拒，库里不该有半条
   const plain = JSON.parse(runKs(['spark', 'list', '--home', home, '--json']).stdout);
   assert.equal(plain.totalSparks, 0);
+});
+
+// ── 二十四轮：capture 面标签账（单条 --tag + 离线队列 tags 字段）─────────────
+
+test('ks spark capture --tag writes the same frontmatter account as create (single-shot)', () => {
+  const home = mkdtempSync(join(tmpdir(), 'ks-spark-tags-'));
+  setupHome(home);
+
+  const captured = JSON.parse(runKs(['spark', 'capture', '--home', home, '--source', 'im', '--title', '移动壳捕获的标签火花',
+    '--text', '手机上想到的事', '--tag', ' 网络 ', '--tag', '代理', '--tag', '网络', '--json']).stdout);
+  assert.deepEqual(captured.spark.tags, ['网络', '代理']);
+  const content = readFileSync(captured.spark.path, 'utf8');
+  assert.match(content, /^tags: \[网络, 代理\]$/m);
+  assert.match(content, /^source: im$/m);
+
+  // 消费面闭环：list --tag 直接收窄到捕获的火花（capture 落的账与 create 同一过滤真源）
+  const tagged = JSON.parse(runKs(['spark', 'list', '--home', home, '--tag', '代理', '--json']).stdout);
+  assert.equal(tagged.totalSparks, 1);
+  assert.equal(tagged.sparks[0].title, '移动壳捕获的标签火花');
+
+  // 无 --tag 不落 tags 行（与 create 同款，不留空账字段）
+  const bare = JSON.parse(runKs(['spark', 'capture', '--home', home, '--source', 'im', '--title', '无标签捕获',
+    '--text', 'plain 内容', '--json']).stdout);
+  assert.deepEqual(bare.spark.tags, []);
+  assert.doesNotMatch(readFileSync(bare.spark.path, 'utf8'), /^tags:/m);
+
+  // 坏值与 create 同款宁红勿默：空值/破坏流式列表字符全拒，且零落档
+  for (const bad of ['   ', 'a,b', '[x]']) {
+    const result = runKs(['spark', 'capture', '--home', home, '--source', 'im', '--title', `坏-${bad.length}`,
+      '--text', 'x', '--tag', bad, '--json']);
+    assert.equal(result.status, 1, `capture --tag ${JSON.stringify(bad)} must exit 1`);
+    assert.match(result.stderr, /--tag must not (be empty|contain commas)/);
+  }
+  const all = JSON.parse(runKs(['spark', 'list', '--home', home, '--json']).stdout);
+  assert.equal(all.totalSparks, 2);
+});
+
+test('capture --batch entries may carry tags: created with the account, bad tags fail per-entry only', () => {
+  const home = mkdtempSync(join(tmpdir(), 'ks-spark-tags-'));
+  setupHome(home);
+  const batchFile = join(home, 'queue.json');
+  writeFileSync(batchFile, JSON.stringify([
+    { title: '队列好标签', text: '内容甲', tags: ['网络', '代理'] },
+    { title: '队列无标签', text: '内容乙' },
+    { title: '队列坏字符', text: '内容丙', tags: ['a,b'] },
+    { title: '队列坏形态', text: '内容丁', tags: '网络' },
+    { title: '队列空标签', text: '内容戊', tags: [' '] },
+  ]));
+
+  const replay = JSON.parse(runKs(['spark', 'capture', '--home', home, '--batch', batchFile, '--json']).stdout);
+  assert.equal(replay.created, 2);
+  assert.equal(replay.failed, 3);
+  const byTitle = Object.fromEntries(replay.entries.map((entry) => [entry.title, entry]));
+  assert.equal(byTitle['队列好标签'].status, 'created');
+  assert.equal(byTitle['队列无标签'].status, 'created');
+  assert.match(byTitle['队列坏字符'].error, /tag must not contain commas/);
+  assert.match(byTitle['队列坏形态'].error, /tags must be an array of strings/);
+  assert.match(byTitle['队列空标签'].error, /tag must not be empty/);
+
+  // 落账核对：好标签条目的 frontmatter 与 list --tag 消费面都通；坏条目零落档
+  const tagged = JSON.parse(runKs(['spark', 'list', '--home', home, '--tag', '网络', '--tag', '代理', '--json']).stdout);
+  assert.equal(tagged.totalSparks, 1);
+  assert.equal(tagged.sparks[0].title, '队列好标签');
+  const plain = JSON.parse(runKs(['spark', 'list', '--home', home, '--json']).stdout);
+  assert.equal(plain.totalSparks, 2);
+
+  // 失败三条照常进 replay-todo（十三轮口径不因 tags 扩面破例），指路面随行
+  assert.ok(replay.todoPending >= 3, `todoPending=${replay.todoPending} 应点名失败留痕`);
+  const todo = JSON.parse(runKs(['spark', 'capture', '--home', home, '--show-todo', '--json']).stdout);
+  assert.ok(todo.pending >= 3, `show-todo pending=${todo.pending} 应点名失败留痕`);
+  assert.ok(todo.batches.some((batch) => batch.failed >= 3));
 });

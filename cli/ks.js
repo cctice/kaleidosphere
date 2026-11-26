@@ -387,6 +387,24 @@ function collectSparkTagInput(args) {
   return tags;
 }
 
+// 二十四轮：capture 面共用同一套 tag 入账校验（单一真源）——单条 capture 的
+// --tag 走上面的 CLI 收集；批量回放队列条目的 tags: [..] 字段走本函数（形态
+// 校验 + 与 CLI 同款字符规则）。坏值抛错：单条面由顶层 catch 出红；批量面由
+// 逐条 try/catch 降级为该条 failed 不连坐（与其余 entry 校验同口径）。
+function validateSparkTagList(value) {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) throw new Error('tags must be an array of strings');
+  const tags = [];
+  for (const raw of value) {
+    if (typeof raw !== 'string') throw new Error('tags must be an array of strings');
+    const tag = raw.trim();
+    if (!tag) throw new Error('tag must not be empty');
+    if (/[,[\]'"\r\n]/.test(tag)) throw new Error('tag must not contain commas, brackets, quotes, or line breaks');
+    if (!tags.includes(tag)) tags.push(tag);
+  }
+  return tags;
+}
+
 function createSpark(home, args) {
   const title = option(args, '--title', true).trim();
   if (!title) throw new Error('--title must not be empty');
@@ -2565,7 +2583,10 @@ function captureSpark(home, args) {
     body = body.trim();
   }
   if (!body) throw new Error(`captured content from ${source} is empty`);
-  const written = writeCapturedSpark(home, { source, title, body });
+  // 二十四轮：capture 也是 spark 写面第三入口——与 create --tag 同一收集器/同一
+  // 校验/同一落账格式（移动壳"想到就采"的火花不必回桌面补标签账）。
+  const tags = collectSparkTagInput(args);
+  const written = writeCapturedSpark(home, { source, title, body, tags });
   if (written.status === 'exists') throw new Error(`spark already exists: ${written.filePath}`);
   return { directory: written.directory, source, spark: written.spark };
 }
@@ -2574,14 +2595,18 @@ function captureSpark(home, args) {
 // 并发写保护（十二轮）：existsSync→write 是 TOCTOU——两进程并发 capture 同题
 // 都过存在检查后写，后写者静默覆盖前写者（丢一条火花）。整段挂 withStateLock，
 // 并发同题恰好一胜一负（负者拿到 exists 报错，不再静默覆盖）。
-function writeCapturedSpark(home, { source, title, body }) {
+function writeCapturedSpark(home, { source, title, body, tags }) {
   return withStateLock(home, 'sparks', () => {
     const directory = sparkDirectory(home);
     fs.mkdirSync(directory, { recursive: true });
     const filePath = path.join(directory, `${sparkSlug(title)}.md`);
     if (fs.existsSync(filePath)) return { status: 'exists', filePath };
     const date = new Date().toISOString().slice(0, 10);
-    fs.writeFileSync(filePath, `---\ntitle: ${title}\ndate: ${date}\nscope: global\nsource: ${source}\n---\n\n# ${title}\n\n${body}\n`);
+    // 二十四轮：capture --tag / 队列 tags 与 create 同款落账——无 tag 不落 tags 行
+    // （与旧火花同款 frontmatter，不留空账字段），有则 YAML 流式列表同格式。
+    const frontMatter = [`title: ${title}`, `date: ${date}`, 'scope: global', `source: ${source}`];
+    if (tags && tags.length > 0) frontMatter.push(`tags: [${tags.join(', ')}]`);
+    fs.writeFileSync(filePath, `---\n${frontMatter.join('\n')}\n---\n\n# ${title}\n\n${body}\n`);
     return { status: 'created', filePath, directory, spark: requireSpark(home, sparkId(filePath)).spark };
   });
 }
@@ -2602,7 +2627,7 @@ function captureSparkBatch(home, args) {
   } catch (error) {
     throw new Error(`cannot read batch file ${batchFile}: ${error.message}`);
   }
-  if (!Array.isArray(entries) || entries.length === 0) throw new Error('batch file must be a non-empty JSON array of {title, text, source?}');
+  if (!Array.isArray(entries) || entries.length === 0) throw new Error('batch file must be a non-empty JSON array of {title, text, source?, tags?}');
   if (entries.length > 200) throw new Error('batch too large (max 200 entries per replay)');
 
   const results = [];
@@ -2618,8 +2643,17 @@ function captureSparkBatch(home, args) {
     if (!title) { results.push({ ...base, title: entry.title, status: 'failed', error: 'title must not be empty' }); continue; }
     if (!body) { results.push({ ...base, title, status: 'failed', error: 'text must not be empty' }); continue; }
     if (!SPARK_CAPTURE_SOURCES.has(source)) { results.push({ ...base, title, status: 'failed', error: `source must be one of: ${[...SPARK_CAPTURE_SOURCES].join(', ')}` }); continue; }
+    // 二十四轮：队列条目可带 tags: [..]（与单条 --tag 同一套字符规则）；坏形态/
+    // 坏字符只废本条不连坐（与其余 entry 校验同口径），失败条目照常进 replay-todo。
+    let tags;
     try {
-      const written = writeCapturedSpark(home, { source, title, body });
+      tags = validateSparkTagList(entry.tags);
+    } catch (error) {
+      results.push({ ...base, title, status: 'failed', error: error.message });
+      continue;
+    }
+    try {
+      const written = writeCapturedSpark(home, { source, title, body, tags });
       results.push(written.status === 'created'
         ? { ...base, title, status: 'created', source, filePath: written.filePath }
         : { ...base, title, status: 'skipped-exists', source, filePath: written.filePath });
@@ -2812,7 +2846,7 @@ function registryImport(home, args) {
   });
 }
 
-const USAGE = 'Usage: ks --help | ks init | ks workspace <add|list> | ks spark <configure|list|find|inspect|create|capture|append-section|check|rm> | ks spark list/find --scope <scope> --tag <t> [--tag <t> AND] --limit <n> | ks spark create --title <t> [--tag <t>...] | ks spark rm --id <id> | ks project <create|register|update|list|search|tag|alias|describe|lifecycle|inspect|resolve|check|migrate|adopt|rules> | ks coordination <open|find|resume|archive> | ks chat-room <open|append|archive|split> | ks version <status|init|check|plan|apply> | ks plugin <list|check> | ks workflow <run> | ks market <list|install|upgrade> <name> --source <path|url> [--refresh] [--force] | ks registry <export|import> --file <path> [--force] | ks route [--shell] [--plan <n>] [--plan --status] | ks spark capture --batch <file> [--source <im|mail>] | ks spark capture --show-todo | ks status [--home <path>] [--json]';
+const USAGE = 'Usage: ks --help | ks init | ks workspace <add|list> | ks spark <configure|list|find|inspect|create|capture|append-section|check|rm> | ks spark list/find --scope <scope> --tag <t> [--tag <t> AND] --limit <n> | ks spark create --title <t> [--tag <t>...] | ks spark rm --id <id> | ks project <create|register|update|list|search|tag|alias|describe|lifecycle|inspect|resolve|check|migrate|adopt|rules> | ks coordination <open|find|resume|archive> | ks chat-room <open|append|archive|split> | ks version <status|init|check|plan|apply> | ks plugin <list|check> | ks workflow <run> | ks market <list|install|upgrade> <name> --source <path|url> [--refresh] [--force] | ks registry <export|import> --file <path> [--force] | ks route [--shell] [--plan <n>] [--plan --status] | ks spark capture --source <im|mail|clipboard> --title <t> [--tag <t>...] [--text|--content-file] | ks spark capture --batch <file> [--source <im|mail>] [entries: {title, text, source?, tags?}] | ks spark capture --show-todo | ks status [--home <path>] [--json]';
 
 function main() {
   const args = process.argv.slice(2);

@@ -31,6 +31,8 @@
    ```
 
    手机上想到的事一条指令进 spark 库，回桌面 `ks spark list` 可见（source: im 回溯）。
+   要顺手打标签（二十四轮起与 `create --tag` 同款）：`--tag 网络 --tag 代理`（可多次，
+   回桌面 `ks spark list --tag 网络` 直接收窄）。
 
 ## 为什么这是"同一入口"而不是平行系统
 
@@ -80,7 +82,7 @@ node /path/to/kaleidosphere/cli/ks.js route --plan 5 --json
 1. 新建「KS 采火花（离线安全）」快捷指令：Ask for Input（标题、正文）→
    Append to Dictionary 存进本地队列（不触网，立即成功）。
 2. 新建「KS 回放队列」快捷指令：取队列 → **Get Contents of JSON** 组装成
-   `[{title, text, source?}]` 数组 → Base64/文件传给 Mac → Run Script Over SSH：
+   `[{title, text, source?, tags?}]` 数组 → Base64/文件传给 Mac → Run Script Over SSH：
 
    ```sh
    node /path/to/kaleidosphere/cli/ks.js spark capture --batch /tmp/ks-queue.json --source im --json
