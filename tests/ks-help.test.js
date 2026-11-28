@@ -25,10 +25,12 @@ test('usage line documents every command group, including spark', () => {
   for (const group of ['init', 'workspace', 'spark', 'project', 'coordination', 'chat-room', 'version']) {
     assert.ok(help.stdout.includes(`ks ${group}`), `usage must mention the "${group}" group`);
   }
-  // 二十二轮：spark 组扩到 10 个子命令（+rm），过滤面（--scope/--limit）进总纲
+  // 二十二轮：spark 组扩到 10 个子命令（+rm），过滤面（--scope/--limit）进总纲；二十五轮 +restore（回收站恢复面）
   // 二十三轮：--tag 进总纲——create 落账（[--tag <t>...] 可多次）、list/find 消费
   // （多 --tag AND 写在总纲里：[--tag <t> AND]），建账/消费两步一个总纲说清
-  assert.match(help.stdout, /ks spark <configure\|list\|find\|inspect\|create\|capture\|append-section\|check\|rm>/);
+  assert.match(help.stdout, /ks spark <configure\|list\|find\|inspect\|create\|capture\|append-section\|check\|rm\|restore>/);
+  assert.match(help.stdout, /ks spark restore --list/);
+  assert.match(help.stdout, /ks spark restore --id <trash-id>/);
   assert.match(help.stdout, /ks spark list\/find --scope <scope> --tag <t> \[--tag <t> AND\] --limit <n>/);
   assert.match(help.stdout, /ks spark create --title <t> \[--tag <t>\.\.\.\]/);
   assert.match(help.stdout, /--home <path>/);

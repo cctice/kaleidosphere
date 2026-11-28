@@ -476,6 +476,61 @@ function removeSpark(home, args) {
   });
 }
 
+// ── 回收站恢复面（维护包二十五轮）─────────────────────────────────────────
+// rm 的安全网此前是"手工找回"——得知道 .trash 目录约定+时间戳文件名才能捞回，
+// 恢复动线没有一等公民入口（二十二轮"误删可手工找回"的实际成本）。两条：
+//   restore --list：回收站清单（原名/标题/入站时刻取文件 mtime 真源/大小），新→旧；
+//   restore --id <回收站条目 id>（即 trash 文件基名）：捞回顶层 sparks 目录。
+// 捞回规则：整段挂 withStateLock（与 rm/create 同锁，捞回与再删并发不互踩）；
+// 顶层同名档已被重建时宁红勿默拒绝——rm 契约"trash 不挡名"的反面是
+// restore 不覆盖活档（要覆盖是人的决定：先 rm 新档再 restore）；坏条目
+// （文件缺失/非 .md）如实红不猜。
+function listTrashedSparks(home) {
+  const directory = sparkDirectory(home);
+  const trashDir = path.join(directory, '.trash');
+  let names = [];
+  try { names = fs.readdirSync(trashDir).filter((n) => n.endsWith('.md')); } catch { /* 无回收站=空清单，不编造 */ }
+  names.sort().reverse(); // 文件名带 UTC 时间戳：字典序新→旧
+  const items = names.map((n) => {
+    const full = path.join(trashDir, n);
+    const original = n.replace(/-\d{4}-\d{2}-\d{2}T[\d-]+Z?\.md$/, '.md');
+    let title = null;
+    try { title = sparkFrontMatter(fs.readFileSync(full, 'utf8')).title ?? null; } catch { /* 坏档如实 null */ }
+    let trashedAt = null;
+    try { trashedAt = fs.statSync(full).mtime.toISOString(); } catch { /* 读不到如实 null */ }
+    let sizeBytes = null;
+    try { sizeBytes = fs.statSync(full).size; } catch { /* 同上 */ }
+    return { id: n.replace(/\.md$/, ''), file: n, original, title, trashedAt, sizeBytes };
+  });
+  return { directory, trashDir, count: items.length, items };
+}
+
+function restoreSpark(home, args) {
+  if (option(args, '--list')) {
+    return listTrashedSparks(home);
+  }
+  const id = option(args, '--id', true);
+  return withStateLock(home, 'sparks', () => {
+    const directory = sparkDirectory(home);
+    const trashDir = path.join(directory, '.trash');
+    const trashPath = path.join(trashDir, `${id}.md`);
+    if (!fs.existsSync(trashPath)) {
+      throw new Error(`no such trash entry: ${id} — run 'ks spark restore --list' to see entries`);
+    }
+    const original = path.basename(id).replace(/-\d{4}-\d{2}-\d{2}T[\d-]+Z?$/, '') + '.md';
+    const target = path.join(directory, original);
+    if (fs.existsSync(target)) {
+      throw new Error(`spark ${original} already exists at top level — restore never overwrites (rm it first if the new one is disposable)`);
+    }
+    fs.renameSync(trashPath, target);
+    return {
+      directory,
+      restored: { id, original, path: target },
+      note: 'restored from .trash — run ks spark list to see it back',
+    };
+  });
+}
+
 function runGit(cwd, args) {
   const result = spawnSync('git', args, { cwd, encoding: 'utf8' });
   if (result.status !== 0) {
@@ -2846,7 +2901,7 @@ function registryImport(home, args) {
   });
 }
 
-const USAGE = 'Usage: ks --help | ks init | ks workspace <add|list> | ks spark <configure|list|find|inspect|create|capture|append-section|check|rm> | ks spark list/find --scope <scope> --tag <t> [--tag <t> AND] --limit <n> | ks spark create --title <t> [--tag <t>...] | ks spark rm --id <id> | ks project <create|register|update|list|search|tag|alias|describe|lifecycle|inspect|resolve|check|migrate|adopt|rules> | ks coordination <open|find|resume|archive> | ks chat-room <open|append|archive|split> | ks version <status|init|check|plan|apply> | ks plugin <list|check> | ks workflow <run> | ks market <list|install|upgrade> <name> --source <path|url> [--refresh] [--force] | ks registry <export|import> --file <path> [--force] | ks route [--shell] [--plan <n>] [--plan --status] | ks spark capture --source <im|mail|clipboard> --title <t> [--tag <t>...] [--text|--content-file] | ks spark capture --batch <file> [--source <im|mail>] [entries: {title, text, source?, tags?}] | ks spark capture --show-todo | ks status [--home <path>] [--json]';
+const USAGE = 'Usage: ks --help | ks init | ks workspace <add|list> | ks spark <configure|list|find|inspect|create|capture|append-section|check|rm|restore> | ks spark list/find --scope <scope> --tag <t> [--tag <t> AND] --limit <n> | ks spark create --title <t> [--tag <t>...] | ks spark rm --id <id> | ks spark restore --list | ks spark restore --id <trash-id> | ks project <create|register|update|list|search|tag|alias|describe|lifecycle|inspect|resolve|check|migrate|adopt|rules> | ks coordination <open|find|resume|archive> | ks chat-room <open|append|archive|split> | ks version <status|init|check|plan|apply> | ks plugin <list|check> | ks workflow <run> | ks market <list|install|upgrade> <name> --source <path|url> [--refresh] [--force] | ks registry <export|import> --file <path> [--force] | ks route [--shell] [--plan <n>] [--plan --status] | ks spark capture --source <im|mail|clipboard> --title <t> [--tag <t>...] [--text|--content-file] | ks spark capture --batch <file> [--source <im|mail>] [entries: {title, text, source?, tags?}] | ks spark capture --show-todo | ks status [--home <path>] [--json]';
 
 function main() {
   const args = process.argv.slice(2);
@@ -2919,6 +2974,11 @@ function main() {
 
   if (command === 'spark' && args[1] === 'rm') {
     printResult({ ok: true, ...removeSpark(home, args) }, true);
+    return;
+  }
+
+  if (command === 'spark' && args[1] === 'restore') {
+    printResult({ ok: true, ...restoreSpark(home, args) }, true);
     return;
   }
 
